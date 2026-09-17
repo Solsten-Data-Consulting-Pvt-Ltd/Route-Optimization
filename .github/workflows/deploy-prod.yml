@@ -1,0 +1,35 @@
+name: Deploy production
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: route-optimization-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_PROD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_PROD_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Deploy Cloud Run service
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROD_PROJECT_ID }}
+        run: >-
+          gcloud run deploy route-optimization
+          --project "$GCP_PROJECT_ID"
+          --region asia-south1
+          --source .
+          --no-allow-unauthenticated
+          --timeout 300

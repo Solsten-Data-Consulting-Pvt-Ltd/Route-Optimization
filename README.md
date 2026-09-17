@@ -143,9 +143,50 @@ uvicorn app.main:app --reload --port 8080
 
 Then open http://localhost:8080/docs or use the curl / Postman steps below (skip the `Authorization` header for local).
 
+## Environments and GitHub CI/CD
+
+The repository has two isolated deployment environments. Pull requests and pushes
+to either deployment branch run the test suite. GitHub Actions then deploys only
+the matching branch:
+
+| Branch | GitHub environment | GCP project | Cloud Run service |
+|---|---|---|---|
+| `dev` | `development` | `hermes-dev-508805` | `route-optimization-dev` |
+| `main` | `production` | configured in GitHub | configured in GitHub |
+
+The deployment workflows use GitHub OpenID Connect (OIDC), not a downloaded GCP
+service-account key. Before the first deployment, configure these repository
+secrets in **Settings → Secrets and variables → Actions**:
+
+| Secret | Value |
+|---|---|
+| `GCP_DEV_WORKLOAD_IDENTITY_PROVIDER` | Full Workload Identity Provider resource name for `hermes-dev-508805` |
+| `GCP_DEV_SERVICE_ACCOUNT` | Development deploy service-account email |
+| `GCP_PROD_WORKLOAD_IDENTITY_PROVIDER` | Full production Workload Identity Provider resource name |
+| `GCP_PROD_SERVICE_ACCOUNT` | Production deploy service-account email |
+
+Add one repository variable: `GCP_PROD_PROJECT_ID`, containing the current
+production GCP project ID. The production workflow deploys `route-optimization`
+in `asia-south1` and preserves the existing Cloud Run environment variables and
+secret mappings. The development workflow expects its Maps secret to be named
+`google-maps-api-key` in `hermes-dev-508805`.
+
+Each deploy service account needs permission to deploy Cloud Run, act as the
+Cloud Run runtime service account, trigger source builds, and read the Maps
+secret. In practice, grant the least-privilege equivalent of Cloud Run Admin,
+Service Account User, Cloud Build Editor, Artifact Registry Writer, and Secret
+Manager Secret Accessor. Protect the `main` branch with required pull-request
+reviews before production deployment.
+
+The existing Cloud Build trigger for `main` must be disabled before merging
+these workflows, otherwise both Cloud Build and GitHub Actions will deploy
+production from the same commit.
+
 ## Deploy to Cloud Run
 
-Deploys from GitHub via Cloud Build. A push to `main` on [Solsten-Data-Consulting-Pvt-Ltd/Route-Optimization](https://github.com/Solsten-Data-Consulting-Pvt-Ltd/Route-Optimization) builds with **Python buildpacks** (not Docker) and rolls out a new Cloud Run revision.
+Deploys are initiated by GitHub Actions. The action uses Cloud Run source deploys,
+which build the repository and roll out a new revision. The service details below
+describe the production target.
 
 ### Service
 
@@ -158,12 +199,12 @@ Deploys from GitHub via Cloud Build. A push to `main` on [Solsten-Data-Consultin
 | Billing | Request-based |
 | Ingress | All |
 | Timeout | 300 seconds |
-| Build type | Google Cloud buildpacks (Python) |
-| Branch trigger | `^main$` |
+| Build type | Cloud Run source deploy (Dockerfile) |
+| Branch trigger | GitHub Actions `main` workflow |
 | Build context | `/` |
 | Function target | leave empty |
 
-The repo root has a `Procfile` (`uvicorn app.main:app`) and `.python-version` (`3.13`). The ubuntu2404 builder does not support Python 3.11.
+The repo root has a `Dockerfile` used by the deployment workflow.
 
 ### Environment variables (Cloud Run console)
 
@@ -181,7 +222,8 @@ Prefer Secret Manager for the Maps key in production. Raise timeout and memory i
 
 ### How the team edits and deploys
 
-Only **`main`** deploys. A push to `dev` or a feature branch does **not** update Cloud Run.
+Pushes to **`dev`** deploy development. A PR into `dev` or `main` only runs CI;
+it does not deploy. A push to **`main`** deploys production.
 
 1. Clone (or pull latest `main`):
 
@@ -206,17 +248,19 @@ git commit -m "Describe why this change exists."
 git push -u origin HEAD
 ```
 
-4. Open a pull request into **`main`** on GitHub. Review, then merge.
+4. Open a pull request into **`dev`** on GitHub. Review, then merge to deploy to
+development. Validate the development service before creating a PR from `dev`
+into **`main`**.
 
-5. The Cloud Build trigger on `^main$` starts automatically. In GCP: **Cloud Build → History** (or the Cloud Run service **Revisions** tab). When the revision is ready, check:
+5. Review the workflow run in GitHub Actions or the Cloud Run service revisions.
+When the revision is ready, check:
 
 - `https://route-optimization-567483485783.asia-south1.run.app/health`
 - `.../save-consignments`
 - `.../run-sorting`
 
-6. Optional: keep `dev` in sync after merge (`git checkout dev; git merge main; git push origin dev`).
-
-Do **not** change env vars in git. Edit them on the Cloud Run service in the console if needed. Do not change `Procfile` or `.python-version` unless the buildpacks start command or Python version must change.
+Do **not** change environment values or secret values in git. Configure them in
+the GitHub environment and Secret Manager as described above.
 
 ## Testing
 
