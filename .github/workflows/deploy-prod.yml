@@ -16,13 +16,17 @@ jobs:
   deploy:
     name: Deploy production
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_PROD_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_PROD_SERVICE_ACCOUNT }}
+
       - uses: google-github-actions/setup-gcloud@v2
+
       - name: Deploy Cloud Run service
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROD_PROJECT_ID }}
@@ -33,3 +37,5 @@ jobs:
           --source .
           --no-allow-unauthenticated
           --timeout 300
+          --update-env-vars BQ_PROJECT="$GCP_PROJECT_ID",FIRESTORE_PROJECT="$GCP_PROJECT_ID",BQ_DATASET=Hermes_Exports,BQ_TABLE=consignments_routing,BQ_STRUCTURED_TABLE=consignments_structured
+          --set-secrets GOOGLE_MAPS_API_KEY=google-maps-api-key:latest
