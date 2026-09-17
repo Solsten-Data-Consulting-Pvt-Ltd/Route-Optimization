@@ -5,7 +5,13 @@ from datetime import datetime, timezone
 
 from google.cloud import bigquery
 
-from app.config import MAX_ROWS_PER_MERGE, MAX_ROWS_PER_UPDATE, TABLE_REF
+from app.config import (
+    GEOCODING_SOURCE,
+    MAX_ROWS_PER_MERGE,
+    MAX_ROWS_PER_UPDATE,
+    STRUCTURED_TABLE_REF,
+    TABLE_REF,
+)
 from app.db.clients import get_bq_client
 
 logger = logging.getLogger(__name__)
@@ -47,6 +53,12 @@ def _row_to_struct_param(row):
     )
 
 
+# MATCHED (consignment already in BQ): updates address/geocode fields only.
+# sorting_id, geohash_group_id and the planned_*/actual_* sequence fields are
+# left untouched so an already-routed consignment doesn't get silently
+# un-grouped by a later re-save.
+# NOT MATCHED (new consignment): inserts a fresh row with a generated
+# sorting_id and geohash_group_id = 'UNASSIGNED', ready for run_sorting.
 MERGE_SQL = f"""
     MERGE `{TABLE_REF}` T
     USING UNNEST(@rows) S
@@ -97,7 +109,7 @@ MERGE_SQL = f"""
         S.starting_latitude, S.starting_longitude, S.latitude, S.longitude, S.locality, S.area,
         S.geohash_locality_loc, S.geohash_building_loc, S.geohash_exact_loc, S.pincode,
         'UNASSIGNED', 0, 0, 0, 0,
-        'google_geocoding_api', S.exception_flag, S.is_commercial, TRUE,
+        '{GEOCODING_SOURCE}', S.exception_flag, S.is_commercial, TRUE,
         S.formatted_address, S.place_id, S.location_type,
         S.street_number, S.route_name, S.district, S.state, S.country_code,
         S.geocode_status, S.geocode_error, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
@@ -114,7 +126,9 @@ def merge_routing_rows(rows):
         batch = rows[i:i + MAX_ROWS_PER_MERGE]
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ArrayQueryParameter("rows", "STRUCT", [_row_to_struct_param(r) for r in batch]),
+                bigquery.ArrayQueryParameter(
+                    "rows", "STRUCT", [_row_to_struct_param(r) for r in batch]
+                ),
             ]
         )
         logger.info("Executing MERGE for batch of %d rows", len(batch))
@@ -138,11 +152,30 @@ def fetch_rows_by_consignment_ids(consignment_ids):
 
 
 def fetch_active_rows_for_drs(drs_no):
+    """Fetch every active consignment for this DRS — the whole DRS gets
+    re-optimized on each run, not just newly-added/unassigned rows. Joined to
+    the structured export so the delivery status is available to the sorter."""
     query = f"""
-        SELECT sorting_id, consignmentId, drsNo, pincode, latitude, longitude,
-               geohash_locality_loc, geohash_building_loc, geohash_exact_loc
-        FROM `{TABLE_REF}`
-        WHERE is_active IS TRUE AND drsNo = @drs_no
+        SELECT
+            C.sorting_id,
+            C.consignmentId,
+            C.drsNo,
+            S.status,
+            S.statusCode,
+            C.pincode,
+            C.latitude,
+            C.longitude,
+            C.geohash_locality_loc,
+            C.geohash_building_loc,
+            C.geohash_exact_loc,
+            C.planned_sequence_order
+        FROM `{TABLE_REF}` AS C
+        JOIN `{STRUCTURED_TABLE_REF}` AS S
+            ON C.drsNo = S.drsNo
+            AND C.consignmentId = S.consignmentId
+        WHERE C.is_active IS TRUE
+          AND C.drsNo = @drs_no
+        ORDER BY C.planned_sequence_order;
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("drs_no", "STRING", drs_no)]
@@ -164,6 +197,9 @@ def fetch_assigned_rows_for_drs(drs_no):
 
 
 def write_group_assignments(updates):
+    """Writes the solved route back onto the existing rows (matched by
+    sorting_id, which already exists from the save pipeline — this is a plain
+    UPDATE, not an upsert, since these rows are guaranteed to exist)."""
     if not updates:
         return
 
