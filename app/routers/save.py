@@ -1,6 +1,7 @@
 import logging
+from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from app.schemas import SaveConsignmentsRequest
@@ -11,10 +12,14 @@ router = APIRouter()
 
 
 @router.post("/save-consignments")
-def save_consignments(payload: SaveConsignmentsRequest):
+def save_consignments(
+    payload: SaveConsignmentsRequest = SaveConsignmentsRequest(),
+    consignmentId: Optional[str] = Query(default=None),
+):
     consignment_ids = payload.consignmentIds
     if not consignment_ids:
-        consignment_ids = [payload.consignmentId] if payload.consignmentId else []
+        single = payload.consignmentId or consignmentId
+        consignment_ids = [single] if single else []
 
     if not consignment_ids:
         return JSONResponse(
@@ -22,7 +27,7 @@ def save_consignments(payload: SaveConsignmentsRequest):
             content={"status": "error", "message": "consignmentIds (or consignmentId) is required"},
         )
 
-    if not all(isinstance(c, str) for c in consignment_ids):
+    if not isinstance(consignment_ids, list) or not all(isinstance(c, str) for c in consignment_ids):
         return JSONResponse(
             status_code=400,
             content={"status": "error", "message": "consignmentIds must be a list of strings"},

@@ -5,3 +5,4 @@ pygeohash
 google-cloud-firestore
 google-cloud-bigquery
 ortools
+rapidfuzz==3.14.6
