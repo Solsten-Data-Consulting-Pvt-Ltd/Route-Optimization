@@ -1,15 +1,114 @@
 # Route Optimization
 
-Single FastAPI service on Cloud Run that geocodes consignments and builds a delivery sequence for a DRS.
+A single FastAPI service running on Cloud Run. It takes delivery consignments,
+finds out where they actually are on the map, and then works out the best order
+for a driver to deliver them.
 
-It replaces the previous two Cloud Functions (`save_consignments` and `run_sorting`) with one service and two HTTP endpoints.
+It replaces the two older Cloud Functions (`save_consignments` and
+`run_sorting`) with one service and two HTTP endpoints.
 
-## What it does
+---
 
-1. **Save** — load consignments from Firestore, geocode receiver addresses with Google Maps, upsert rows into BigQuery, then sync `consignments_routing` back to Firestore.
-2. **Sort** — load active consignments for a DRS, solve an open-path TSP from the DRS starting point with OR-Tools, write sequence/cluster fields to BigQuery, then sync Firestore.
+## What it does, in plain words
 
-Typical order: save consignments first, then run sorting when the driver/hub starting point exists.
+There are **two jobs**. They run separately, and the order matters.
+
+### Job 1 — Save (`POST /save-consignments`)
+
+**Question it answers: "where is this parcel going?"**
+
+You give it a list of consignment IDs. For each one it:
+
+1. Reads the consignment document from Firestore (`consignments`) to get the
+   receiver name and address.
+2. Cleans the address into one single line, and joins name + address into one
+   search string.
+3. Looks that address up in the **geocode cache** (Firestore `geocode_cache`).
+   If the same (or a very similar) address was geocoded before *and* an ops
+   person marked it `verified`, it reuses that answer and skips the API call.
+4. On a cache miss, calls the **Google Places API** to get latitude, longitude,
+   pincode, locality, area and so on. The new result is written back into the
+   cache as `verified: false`, so it is stored but not yet trusted for reuse.
+5. Turns the coordinates into geohashes at three precisions — exact (8),
+   building (6) and locality (5). The locality geohash is what later groups
+   nearby parcels into clusters.
+6. Writes the row into BigQuery (`consignments_routing`) with a `MERGE`:
+   - **New consignment** → a new row is inserted, with a generated `sorting_id`
+     and `geohash_group_id = 'UNASSIGNED'`.
+   - **Existing consignment** → only the address and geocode columns are
+     updated. The sequence and group columns are deliberately **not** touched,
+     so re-saving a parcel does not wipe out a route that was already built.
+7. Copies the resulting rows back into Firestore (`consignments_routing`) so the
+   app can read them.
+
+At this point every parcel has a location, but **no delivery order yet**. The
+`starting_*` columns are filled with placeholders (`PENDING_OPTIMIZATION`, 0, 0)
+because the driver's start point often does not exist yet when saving happens.
+
+If a consignment has no usable address, or Google cannot resolve it, the row is
+still written with `geocode_status = 'failed'` and the reason in
+`geocode_error`, and the consignment is listed in the response `failures`.
+
+### Job 2 — Sort (`POST /run-sorting`)
+
+**Question it answers: "in what order should the driver deliver them?"**
+
+You give it one DRS number. For that DRS it:
+
+1. Reads the driver's starting point (hub/depot) from Firestore
+   `drs_starting_point`. If it is missing, the first stop is used as the hub and
+   a warning is logged.
+2. Reads **every active parcel** for that DRS from BigQuery. This query joins
+   two tables:
+   - `consignments_routing` — our table: coordinates, geohashes, current
+     sequence numbers.
+   - `consignments_structured` — the delivery-status export: `status` and
+     `statusCode`.
+3. Splits the parcels into two piles using that status:
+   - **Already delivered** (`statusCode = 'DE'`) → these are *frozen*. They keep
+     the sequence number they already have, and that number is marked as taken.
+   - **Still pending** → these go into the optimizer.
+4. Solves the order with **OR-Tools**, as an open-path TSP: start at the hub,
+   visit every pending stop once, and do not come back. Distance is
+   straight-line (haversine), not road distance. The solver is time-capped at
+   1 second (≤10 stops), 3 seconds (≤50) or 5 seconds (more).
+5. Drops the solved stops into the sequence numbers that are still free, in
+   order.
+6. For each stop it also writes:
+   - `geohash_group_id` = `<drsNo>_<locality geohash>` — the cluster the stop
+     belongs to.
+   - `planned_sequence_order` — position in the whole route.
+   - `planned_inside_cluster_sequence` — position inside its own cluster.
+   - `actual_*` copies of both. These start identical to the plan and are meant
+     to drift later as the driver actually works (e.g. skips a stop).
+7. Writes all of that back to BigQuery, then syncs the updated rows to Firestore
+   `consignments_routing`.
+
+#### Why the delivery status matters — an example
+
+A DRS has 10 stops. The driver has finished stops 1, 2 and 3. Two new parcels
+now arrive, so sorting is run again.
+
+- **Without** the status join, the optimizer would renumber all 10 stops from 1.
+  Parcels the driver already delivered would move around and the route on his
+  phone would stop matching reality.
+- **With** it, stops 1–3 are recognised as delivered, their numbers are locked,
+  and only the remaining parcels are re-optimized into the free slots 4–10.
+
+That is the only reason `consignments_structured` is read. Note it is an
+**inner join**: a parcel present in `consignments_routing` but missing from
+`consignments_structured` is silently skipped and never sorted.
+
+### Typical order of operations
+
+```
+save-consignments   ->  parcel has coordinates, no order yet
+(driver start point exists in drs_starting_point)
+run-sorting         ->  parcel has cluster + sequence number
+run-sorting again   ->  delivered stops stay put, the rest are re-optimized
+```
+
+---
 
 ## Endpoints
 
@@ -46,7 +145,9 @@ Success (`200`):
 }
 ```
 
-`status` is `partial_success` when some ids fail geocoding or are missing. Failures are listed as `{ "consignmentId", "reason" }`. Missing body returns `400`; unexpected errors return `500`.
+`status` is `partial_success` when some ids fail geocoding or are missing.
+Failures are listed as `{ "consignmentId", "reason" }`. Missing body returns
+`400`; unexpected errors return `500`.
 
 ### Run sorting
 
@@ -72,18 +173,36 @@ Success (`200`):
 }
 ```
 
-If there are no active BigQuery rows for that DRS, `optimized_count` is `0` and a `message` is returned.
+`optimized_count` is the number of rows that were given a new sequence — that
+is, pending stops only. Delivered stops are counted as part of the route length
+but are not re-numbered, so this figure is usually smaller than the DRS size.
+
+If there are no active BigQuery rows for that DRS, `optimized_count` is `0` and
+a `message` is returned.
+
+---
 
 ## Data stores
 
-| Store | Use |
-|-------|-----|
-| Firestore `consignments` | Source consignment documents |
-| Firestore `drs_starting_point` | Hub/depot lat/lon and address, keyed by DRS number |
-| Firestore `consignments_routing` | Routing snapshot write-back (commented out in the pipelines) |
-| BigQuery `consignments_routing_test` | System of record for geocode fields, sequence, and clusters |
+| Store | Read / Write | Use |
+|-------|--------------|-----|
+| Firestore `consignments` | read | Source consignment documents (receiver name and address) |
+| Firestore `geocode_cache` | read + write | Previously geocoded addresses. Only entries flagged `verified: true` are reused; new entries are stored as `verified: false` |
+| Firestore `drs_starting_point` | read | Hub/depot lat/lon and address, keyed by DRS number |
+| Firestore `consignments_routing` | write | Mirror of the BigQuery row, written after both pipelines, so the app can read it |
+| BigQuery `consignments_routing` (`BQ_TABLE`) | read + write | System of record for geocode fields, clusters and sequence |
+| BigQuery `consignments_structured` (`BQ_STRUCTURED_TABLE`) | read only | Delivery status (`status`, `statusCode`). Used only to protect already-delivered stops during re-sorting |
 
-Save writes geocode data and leaves grouping as `UNASSIGNED` with `starting_*` placeholders. Sort fills `geohash_group_id`, `planned_*` / `actual_*` sequence, and the real starting point.
+Save writes geocode data and leaves grouping as `UNASSIGNED` with `starting_*`
+placeholders. Sort fills `geohash_group_id`, the `planned_*` / `actual_*`
+sequence fields, and the real starting point.
+
+The two Firestore syncs differ slightly: after save, the geocode provenance
+fields (`formatted_address`, `place_id`, `geocode_status`, …) are included;
+after sorting only the routing fields are written, so the provenance from save
+is left untouched. Both writes are merges.
+
+---
 
 ## Layout
 
@@ -97,96 +216,102 @@ app/
     sorting.py
   services/               Business logic
     address.py            Address cleanup
-    geocoding.py          Google Maps geocode
+    geocoding.py          Google Places lookup + flag derivation
     save.py               Save pipeline
     tsp.py                OR-Tools open-path TSP
     sorting.py            Sort pipeline
   db/                     Data access
     clients.py            Shared BQ / Firestore clients
     firestore.py          Firestore reads/writes
+    geocache.py           Address-scoped geocode cache (exact + fuzzy match)
     bigquery.py           BigQuery reads/writes
 Procfile                  Cloud Run buildpacks start command
 .python-version           Python 3.13 (ubuntu2404 builder)
 requirements.txt
 ```
 
+---
+
 ## Environment variables
 
-| Variable | Required | Default | Description |
+All of these are read with `os.environ[...]` and have **no defaults** — if one
+is missing the app fails to start.
+
+| Variable | Required | Example | Description |
 |----------|----------|---------|-------------|
-| `GOOGLE_MAPS_API_KEY` | Yes (save) | — | Geocoding API key |
-| `BQ_PROJECT` | No | `prj-dev-hermes` | GCP project for BigQuery |
-| `BQ_DATASET` | No | `Hermes_Exports` | BigQuery dataset |
-| `BQ_TABLE` | No | `consignments_routing_test` | BigQuery table |
-| `FIRESTORE_PROJECT` | No | same as `BQ_PROJECT` | Firestore project |
+| `GOOGLE_MAPS_API_KEY` | Yes | — | Google Places / Geocoding API key |
+| `BQ_PROJECT` | Yes | `prj-dev-hermes` | GCP project for BigQuery |
+| `BQ_DATASET` | Yes | `Hermes_Exports` | BigQuery dataset holding both tables |
+| `BQ_TABLE` | Yes | `consignments_routing` | Routing table (read + write) |
+| `BQ_STRUCTURED_TABLE` | Yes | `consignments_structured` | Delivery-status export (read only) |
+| `FIRESTORE_PROJECT` | Yes | `prj-dev-hermes` | Firestore project |
 | `PORT` | Cloud Run | `8080` | HTTP port |
 
-The runtime service account needs BigQuery Data Editor (or equivalent query/update on the table) and Firestore read/write on the collections above.
+Both BigQuery tables are expected in the same project and dataset.
+
+The runtime service account needs BigQuery Data Editor on `BQ_TABLE` (or the
+equivalent query/update rights), read access on `BQ_STRUCTURED_TABLE`, and
+Firestore read/write on the collections listed above.
+
+Tuning constants that are **not** environment variables live in `app/config.py`:
+geohash lengths, batch sizes (500), the fuzzy-cache threshold (85) and the cache
+snapshot TTL (300 s).
+
+---
 
 ## Local run
 
-Python 3.11+ locally (Cloud Run buildpacks use 3.13). Application Default Credentials (for example `gcloud auth application-default login`).
+Python 3.11+ locally (Cloud Run buildpacks use 3.13). Application Default
+Credentials (for example `gcloud auth application-default login`).
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-$env:GOOGLE_MAPS_API_KEY = "YOUR_KEY"
-$env:BQ_PROJECT = "prj-dev-hermes"
-$env:BQ_DATASET = "Hermes_Exports"
-$env:BQ_TABLE = "consignments_routing_test"
-$env:FIRESTORE_PROJECT = "prj-dev-hermes"
+$env:GOOGLE_MAPS_API_KEY  = "YOUR_KEY"
+$env:BQ_PROJECT           = "prj-dev-hermes"
+$env:BQ_DATASET           = "Hermes_Exports"
+$env:BQ_TABLE             = "consignments_routing"
+$env:BQ_STRUCTURED_TABLE  = "consignments_structured"
+$env:FIRESTORE_PROJECT    = "prj-dev-hermes"
 
 uvicorn app.main:app --reload --port 8080
 ```
 
-Then open http://localhost:8080/docs or use the curl / Postman steps below (skip the `Authorization` header for local).
+Then open http://localhost:8080/docs or use the curl / Postman steps below (skip
+the `Authorization` header for local).
 
-## Environments and GitHub CI/CD
+---
 
-The repository has two isolated deployment environments. Pull requests and pushes
-to either deployment branch run the test suite. GitHub Actions then deploys only
-the matching branch:
+## Environments and deployment
 
-| Branch | GitHub environment | GCP project | Cloud Run service |
-|---|---|---|---|
-| `dev` | `development` | `hermes-dev-508805` | `route-optimization-dev` |
-| `main` | `production` | configured in GitHub | configured in GitHub |
+The repository has two isolated environments, and the branch decides which one
+you are deploying to:
 
-The deployment workflows use GitHub OpenID Connect (OIDC), not a downloaded GCP
-service-account key. Before the first deployment, configure these repository
-secrets in **Settings → Secrets and variables → Actions**:
+| Branch | Environment | Cloud Run service |
+|---|---|---|
+| `dev` | development | `route-optimization-dev` |
+| `main` | production | `route-optimization` |
 
-| Secret | Value |
-|---|---|
-| `GCP_DEV_WORKLOAD_IDENTITY_PROVIDER` | Full Workload Identity Provider resource name for `hermes-dev-508805` |
-| `GCP_DEV_SERVICE_ACCOUNT` | Development deploy service-account email |
-| `GCP_PROD_WORKLOAD_IDENTITY_PROVIDER` | Full production Workload Identity Provider resource name |
-| `GCP_PROD_SERVICE_ACCOUNT` | Production deploy service-account email |
+Pull requests run the test suite only. Merging is what deploys.
 
-Add one repository variable: `GCP_PROD_PROJECT_ID`, containing the current
-production GCP project ID. The production workflow deploys `route-optimization`
-in `asia-south1` and preserves the existing Cloud Run environment variables and
-secret mappings. The development workflow expects its Maps secret to be named
-`google-maps-api-key` in `hermes-dev-508805`.
+> **Full details are in [`DEPLOYMENT.md`](./DEPLOYMENT.md)** — every GitHub
+> secret and variable and what it is for, how the OIDC login to GCP works, the
+> deploy command flag by flag, one-time GCP setup, the step-by-step flow for
+> shipping a bug fix, rollback, and troubleshooting.
 
-Each deploy service account needs permission to deploy Cloud Run, act as the
-Cloud Run runtime service account, trigger source builds, and read the Maps
-secret. In practice, grant the least-privilege equivalent of Cloud Run Admin,
-Service Account User, Cloud Build Editor, Artifact Registry Writer, and Secret
-Manager Secret Accessor. Protect the `main` branch with required pull-request
-reviews before production deployment.
+Two things to know before you change anything:
 
-The existing Cloud Build trigger for `main` must be disabled before merging
-these workflows, otherwise both Cloud Build and GitHub Actions will deploy
-production from the same commit.
+- **The app's environment variables are set by the workflow files**, not the
+  Cloud Run console. Editing them in the console lasts only until the next
+  deploy. To change a table or dataset name, edit the workflow YAML.
+- **`GOOGLE_MAPS_API_KEY` comes from Secret Manager**, secret name
+  `google-maps-api-key`. It is never in git.
 
-## Deploy to Cloud Run
+---
 
-Deploys are initiated by GitHub Actions. The action uses Cloud Run source deploys,
-which build the repository and roll out a new revision. The service details below
-describe the production target.
+## Cloud Run service reference
 
 ### Service
 
@@ -206,61 +331,39 @@ describe the production target.
 
 The repo root has a `Dockerfile` used by the deployment workflow.
 
-### Environment variables (Cloud Run console)
+### Environment variables on the service
 
-Set these once on the service (Containers → Variables). Later GitHub deploys keep them; you do not pass them in a deploy command.
+These are applied by the deploy workflow on every rollout, so the workflow YAML
+is the place to change them:
 
-| Variable | Example |
-|----------|---------|
-| `BQ_PROJECT` | `prj-dev-hermes` |
-| `BQ_DATASET` | `Hermes_Exports` |
-| `BQ_TABLE` | `consignments_routing_test` |
-| `FIRESTORE_PROJECT` | `prj-dev-hermes` |
-| `GOOGLE_MAPS_API_KEY` | your key |
+| Variable | Set by | Example |
+|----------|--------|---------|
+| `BQ_PROJECT` | workflow (from the project-ID variable) | `prj-dev-hermes` |
+| `FIRESTORE_PROJECT` | workflow (from the project-ID variable) | `prj-dev-hermes` |
+| `BQ_DATASET` | workflow | `Hermes_Exports` |
+| `BQ_TABLE` | workflow | `consignments_routing` |
+| `BQ_STRUCTURED_TABLE` | workflow | `consignments_structured` |
+| `GOOGLE_MAPS_API_KEY` | Secret Manager (`google-maps-api-key:latest`) | — |
 
-Prefer Secret Manager for the Maps key in production. Raise timeout and memory if DRS batches are large; sorting time grows with stop count (OR-Tools search is capped at 1–5 seconds internally).
+Memory, CPU and concurrency are *not* set by the workflow, so console changes to
+those survive a deploy. Raise timeout and memory if DRS batches are large;
+sorting time grows with stop count (OR-Tools search is capped at 1–5 seconds
+internally).
 
-### How the team edits and deploys
+### Shipping a change
 
-Pushes to **`dev`** deploy development. A PR into `dev` or `main` only runs CI;
-it does not deploy. A push to **`main`** deploys production.
+The short version — the full walkthrough is in
+[`DEPLOYMENT.md`](./DEPLOYMENT.md):
 
-1. Clone (or pull latest `main`):
-
-```powershell
-git clone git@github.com:Solsten-Data-Consulting-Pvt-Ltd/Route-Optimization.git
-cd Route-Optimization
-git checkout main
-git pull origin main
+```
+branch off dev  ->  PR into dev   ->  merge  ->  development deploys
+verify on development
+PR dev -> main  ->  merge  ->  production deploys
 ```
 
-2. Create a branch. Do not commit feature work straight on `main`.
+Never commit directly to `dev` or `main`, and never put a secret value in git.
 
-```powershell
-git checkout -b feat/short-description
-```
-
-3. Edit, run locally (see **Local run**), then commit and push the branch:
-
-```powershell
-git add .
-git commit -m "Describe why this change exists."
-git push -u origin HEAD
-```
-
-4. Open a pull request into **`dev`** on GitHub. Review, then merge to deploy to
-development. Validate the development service before creating a PR from `dev`
-into **`main`**.
-
-5. Review the workflow run in GitHub Actions or the Cloud Run service revisions.
-When the revision is ready, check:
-
-- `https://route-optimization-567483485783.asia-south1.run.app/health`
-- `.../save-consignments`
-- `.../run-sorting`
-
-Do **not** change environment values or secret values in git. Configure them in
-the GitHub environment and Secret Manager as described above.
+---
 
 ## Testing
 
@@ -276,9 +379,12 @@ The service requires IAM authentication, so every request needs a Bearer token:
 $token = gcloud auth print-identity-token
 ```
 
-The token expires in about an hour. Re-run `print-identity-token` if you get `401` or `403`.
+The token expires in about an hour. Re-run `print-identity-token` if you get
+`401` or `403`.
 
-On Windows PowerShell, do **not** put JSON inline in `curl.exe -d '...'`. PowerShell strips quotes and FastAPI returns `json_invalid`. Write the body to a file instead.
+On Windows PowerShell, do **not** put JSON inline in `curl.exe -d '...'`.
+PowerShell strips quotes and FastAPI returns `json_invalid`. Write the body to a
+file instead.
 
 ### curl — health
 
@@ -368,10 +474,10 @@ curl -g -sS -X POST http://localhost:8080/run-sorting \
 
 1. Create a collection, e.g. **Route Optimization**.
 2. Add a collection variable `baseUrl` = `https://route-optimization-567483485783.asia-south1.run.app` (or `http://localhost:8080`).
-3. **Auth (Cloud Run only)**  
-   - In the collection **Authorization** tab, type **Bearer Token**.  
-   - Token value: run `gcloud auth print-identity-token` in a terminal and paste the output.  
-   - Child requests can use **Inherit auth from parent**.  
+3. **Auth (Cloud Run only)**
+   - In the collection **Authorization** tab, type **Bearer Token**.
+   - Token value: run `gcloud auth print-identity-token` in a terminal and paste the output.
+   - Child requests can use **Inherit auth from parent**.
    - For local, set Authorization to **No Auth**.
 4. Create three requests:
 
@@ -418,4 +524,27 @@ curl -g -sS -X POST http://localhost:8080/run-sorting \
    - `400` — missing `consignmentIds` / `drsno`.
    - `500` with a BigQuery `Name ... not found inside T` — the target table is missing a column (for example `geocode_address`).
 
-Save can take a while (geocoding). In Postman set **Settings → Request timeout** high enough (e.g. 300000 ms), matching the Cloud Run timeout of 300 seconds.
+Save can take a while (geocoding). In Postman set **Settings → Request timeout**
+high enough (e.g. 300000 ms), matching the Cloud Run timeout of 300 seconds.
+
+---
+
+## Known rough edges
+
+Worth knowing before you debug something surprising:
+
+- **The status join is an inner join.** A parcel in `consignments_routing` with
+  no matching row in `consignments_structured` is dropped from sorting entirely
+  and never gets a sequence number.
+- **One row per consignment is assumed.** If `consignments_structured` ever
+  holds more than one row for the same `(drsNo, consignmentId)`, the join will
+  fan out and the same parcel will be sorted more than once.
+- **Distances are straight-line, not road distance.** Haversine ignores
+  one-ways, rivers and flyovers, so the solved order is a good approximation and
+  not a driving-time optimum.
+- **A delivered parcel with no existing sequence number** cannot hold a slot; it
+  is logged as a warning and the numbering can end up not landing exactly on
+  `1..N`.
+- **Nothing in this service sets `verified: true`** on a geocode cache entry.
+  That is an ops decision made outside the app, and until it is made the cached
+  address will not be reused.
