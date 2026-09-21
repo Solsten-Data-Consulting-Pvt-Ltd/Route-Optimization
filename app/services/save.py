@@ -72,10 +72,14 @@ def _failed_row(drs_no, drs_id, driver_numeric_id, consignment_id,
     )
 
 
-def _geocode(address):
-    """Cache first, Places on a miss. A cache failure never fails the save."""
+def _geocode(address, lookup_address=None):
+    """Cache first, Places on a miss. A cache failure never fails the save.
+
+    Fix 1 — `lookup_address` (receiver_address without name prefix) is
+    forwarded to the cache functions so that the cache key is location-only.
+    """
     try:
-        cached = get_cached_geocode(address)
+        cached = get_cached_geocode(address, lookup_address=lookup_address)
     except Exception:
         logger.exception("Geocode cache read failed for '%s'", address[:80])
         cached = None
@@ -88,7 +92,7 @@ def _geocode(address):
 
     if geocode_result:
         try:
-            save_to_cache(address, geocode_result)
+            save_to_cache(address, geocode_result, lookup_address=lookup_address)
         except Exception:
             logger.exception("Geocode cache write failed for '%s'", address[:80])
 
@@ -171,7 +175,10 @@ def save_consignments_pipeline(consignment_ids):
             ))
             continue
 
-        geocode_result, error_reason, _error_code = _geocode(geocode_address_str)
+        geocode_result, error_reason, _error_code = _geocode(
+            geocode_address_str,
+            lookup_address=receiver_address or None,
+        )
         geocode_error = error_reason
         geocode_status = "success" if geocode_result else "failed"
 

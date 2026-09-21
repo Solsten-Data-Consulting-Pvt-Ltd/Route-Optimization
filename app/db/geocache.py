@@ -36,6 +36,30 @@ Two things differ from the original, both deliberate:
 `pincode_match` is recomputed on every hit rather than read from the cache:
 normalization strips the pincode, so two addresses that differ only by their
 pincode share a cache entry, and the stored flag would be about the wrong one.
+
+Three improvements over the original port:
+
+  Fix 1 — Address-only cache lookup key.
+     `get_cached_geocode` and `save_to_cache` now accept an optional
+     `lookup_address` parameter (the raw receiver address without the
+     receiver name prefix).  Cache lookup and the Firestore document key both
+     use the normalized form of `lookup_address` when it is provided.  The
+     full `geocode_address` (name + address) is still sent to the Places API
+     and stored as `geocode_address_raw` for traceability, but the cache key
+     is keyed on location only.  This means two consignments for different
+     people at the same building (e.g. different employees at Shahi Exports)
+     share one cache entry instead of each causing a fresh API call.
+
+  Fix 2 — Google Plus Code stripping.
+     Plus Codes (e.g. "VPMX+F5R") that appear in raw address strings are
+     stripped by `normalize_address` before fuzzy comparison.  They are
+     meaningless tokens that would otherwise cause a genuine location match
+     to score below the threshold.
+
+  Fix 3 — Building-name abbreviation normalisation.
+     A small `BUILDING_VARIANTS` table (analogous to `CITY_VARIANTS`) maps
+     known abbreviation patterns to their canonical forms so that e.g.
+     "R K Complex" and "RK Com" normalise to the same token.
 """
 
 import hashlib
@@ -63,7 +87,24 @@ CITY_VARIANTS = {
     # (the ~30% address-repeat-rate finding is the right source to mine this from).
 }
 
+# Fix 3 — building-name abbreviations.
+# Keyed on the LONGER/spaced form so the substitution always goes from verbose
+# to compact; order does not matter because each key is matched independently.
+BUILDING_VARIANTS = {
+    "r k complex": "rk com",
+    "domasandra":  "dommasandra",   # common missing-m typo seen in the wild
+}
+
 PINCODE_RE = re.compile(r"\b\d{6}\b")
+
+# Fix 2 — Google Plus Codes (e.g. "VPMX+F5R", "9F2X+4C").
+# Format: 4-8 uppercase alphanumeric chars (excluding vowels/1), a "+",
+# then 2-3 more.  Strip them before fuzzy comparison — they are opaque
+# location tokens that match nothing in a human-written address string.
+PLUS_CODE_RE = re.compile(
+    r"\b[23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{2,3}\b",
+    re.IGNORECASE,
+)
 
 # Everything places_search_address returns, minus pincode_match, which is
 # recomputed per lookup against the address actually being geocoded.
@@ -93,9 +134,13 @@ def normalize_address(address: str) -> str:
         return ""
     s = address.lower().strip()
     s = re.sub(r"[,\s]+", " ", s)
-    s = PINCODE_RE.sub("", s)  # strip any 6-digit pincode, not just 560xxx
+    s = PINCODE_RE.sub("", s)      # strip any 6-digit pincode, not just 560xxx
+    s = PLUS_CODE_RE.sub("", s)    # Fix 2: strip Google Plus Codes
     for variant, canonical in CITY_VARIANTS.items():
         s = re.sub(r"\b" + re.escape(variant) + r"\b", canonical, s)
+    # Fix 3: normalise building-name abbreviations (longer form -> compact form)
+    for verbose, compact in BUILDING_VARIANTS.items():
+        s = s.replace(verbose, compact)
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
@@ -146,7 +191,6 @@ def _exact_lookup(normalized: str):
         return None
     return docs[0].id, (docs[0].to_dict() or {})
 
-
 def _fuzzy_lookup(normalized: str):
     entries = _verified_entries()
     if not entries:
@@ -181,9 +225,23 @@ def _result_from_cache(data: dict, address: str) -> dict:
     return result
 
 
-def get_cached_geocode(address: str) -> Optional[dict]:
-    """Best-match lookup against verified cache entries, or None on a miss."""
-    normalized = normalize_address(address)
+def get_cached_geocode(
+    address: str,
+    lookup_address: Optional[str] = None,
+) -> Optional[dict]:
+    """Best-match lookup against verified cache entries, or None on a miss.
+
+    Fix 1 — `lookup_address` is the raw receiver address WITHOUT the receiver
+    name prefix.  When provided, the cache lookup key is derived from
+    `lookup_address` so that deliveries to the same building for different
+    recipients (e.g. different employees at Shahi Exports) still get a hit.
+    `address` (full geocode string: name + address) is only used to recompute
+    `pincode_match` on a hit and is not used as the lookup key.
+
+    If `lookup_address` is omitted the behaviour is identical to before.
+    """
+    key_str = lookup_address if lookup_address else address
+    normalized = normalize_address(key_str)
     if not normalized:
         return None
 
@@ -200,8 +258,24 @@ def get_cached_geocode(address: str) -> Optional[dict]:
     return _result_from_cache(data, address)
 
 
-def save_to_cache(address: str, geocode_result: dict) -> None:
-    normalized = normalize_address(address)
+def save_to_cache(
+    address: str,
+    geocode_result: dict,
+    lookup_address: Optional[str] = None,
+) -> None:
+    """Persist a geocode result to the cache.
+
+    Fix 1 — `lookup_address` is the raw receiver address WITHOUT the receiver
+    name prefix.  When provided, both the Firestore document key and
+    `address_normalized` are derived from `lookup_address` so that future
+    consignments for different recipients at the same location can find this
+    entry.  `address` (full geocode string sent to the API) is stored as
+    `geocode_address_raw` for traceability.
+
+    If `lookup_address` is omitted the behaviour is identical to before.
+    """
+    key_str = lookup_address if lookup_address else address
+    normalized = normalize_address(key_str)
     if not normalized or not geocode_result:
         return
 
@@ -209,8 +283,9 @@ def save_to_cache(address: str, geocode_result: dict) -> None:
     payload["types"] = payload.get("types") or []
     payload["partial_match"] = bool(payload.get("partial_match"))
     payload.update({
-        "address_raw": address,
-        "address_normalized": normalized,
+        "address_raw":         address,     # full geocode string (name + address)
+        "geocode_address_raw": address,     # alias kept for clarity
+        "address_normalized":  normalized,  # Fix 1: keyed on location only
         "source": "api",
         "updated_at": firestore.SERVER_TIMESTAMP,
     })
@@ -230,3 +305,4 @@ def save_to_cache(address: str, geocode_result: dict) -> None:
         "hit_count": 0,
         "created_at": firestore.SERVER_TIMESTAMP,
     })
+
