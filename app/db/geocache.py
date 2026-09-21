@@ -66,7 +66,7 @@ import hashlib
 import logging
 import re
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 from rapidfuzz import fuzz, process, utils
 
@@ -225,11 +225,11 @@ def _result_from_cache(data: dict, address: str) -> dict:
     return result
 
 
-def get_cached_geocode(
+def get_cached_geocode_with_outcome(
     address: str,
     lookup_address: Optional[str] = None,
-) -> Optional[dict]:
-    """Best-match lookup against verified cache entries, or None on a miss.
+) -> Tuple[Optional[dict], str]:
+    """Return a cached result and its outcome: exact_hit, fuzzy_hit, or miss.
 
     Fix 1 — `lookup_address` is the raw receiver address WITHOUT the receiver
     name prefix.  When provided, the cache lookup key is derived from
@@ -243,19 +243,40 @@ def get_cached_geocode(
     key_str = lookup_address if lookup_address else address
     normalized = normalize_address(key_str)
     if not normalized:
-        return None
+        return None, "miss"
 
-    hit = _exact_lookup(normalized) or _fuzzy_lookup(normalized)
+    hit = _exact_lookup(normalized)
+    outcome = "exact_hit"
     if not hit:
-        return None
+        hit = _fuzzy_lookup(normalized)
+        outcome = "fuzzy_hit"
+    if not hit:
+        return None, "miss"
 
     doc_id, data = hit
     try:
-        _collection().document(doc_id).update({"hit_count": (data.get("hit_count") or 0) + 1})
+        _collection().document(doc_id).update({
+            "hit_count": firestore.Increment(1),
+            "last_hit_at": firestore.SERVER_TIMESTAMP,
+        })
     except Exception:
         logger.exception("Geocode cache hit_count update failed")
 
-    return _result_from_cache(data, address)
+    return _result_from_cache(data, address), outcome
+
+
+def get_cached_geocode(
+    address: str,
+    lookup_address: Optional[str] = None,
+) -> Optional[dict]:
+    """Best-match lookup against verified cache entries, or None on a miss.
+
+    This compatibility wrapper preserves the original public cache API. Save
+    pipeline analytics use ``get_cached_geocode_with_outcome`` to distinguish
+    exact and fuzzy reuse without changing any existing callers.
+    """
+    result, _outcome = get_cached_geocode_with_outcome(address, lookup_address)
+    return result
 
 
 def save_to_cache(

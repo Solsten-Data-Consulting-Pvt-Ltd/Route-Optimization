@@ -188,6 +188,7 @@ a `message` is returned.
 |-------|--------------|-----|
 | Firestore `consignments` | read | Source consignment documents (receiver name and address) |
 | Firestore `geocode_cache` | read + write | Previously geocoded addresses. Only entries flagged `verified: true` are reused; new entries are stored as `verified: false` |
+| Firestore `drs_cache_metrics` | write | One aggregate cache summary per DRS save run: exact/fuzzy hits, misses, API calls, and hit rate. This is written after the routing save and never blocks it. |
 | Firestore `drs_starting_point` | read | Hub/depot lat/lon and address, keyed by DRS number |
 | Firestore `consignments_routing` | write | Mirror of the BigQuery row, written after both pipelines, so the app can read it |
 | BigQuery `consignments_routing` (`BQ_TABLE`) | read + write | System of record for geocode fields, clusters and sequence |

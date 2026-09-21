@@ -8,8 +8,9 @@ import pygeohash as pgh
 
 from app.config import GEOHASH_BUILDING_LEN, GEOHASH_LOCALITY_LEN, GOOGLE_MAPS_API_KEY
 from app.db.bigquery import fetch_rows_by_consignment_ids, merge_routing_rows
+from app.db.cache_metrics import write_drs_cache_metrics
 from app.db.firestore import get_consignments_by_id, upsert_consignments_routing
-from app.db.geocache import get_cached_geocode, save_to_cache
+from app.db.geocache import get_cached_geocode_with_outcome, save_to_cache
 from app.services.address import build_geocode_address, normalize_to_single_line
 from app.services.geocoding import (
     derive_exception_flag,
@@ -79,14 +80,17 @@ def _geocode(address, lookup_address=None):
     forwarded to the cache functions so that the cache key is location-only.
     """
     try:
-        cached = get_cached_geocode(address, lookup_address=lookup_address)
+        cached, cache_outcome = get_cached_geocode_with_outcome(
+            address, lookup_address=lookup_address
+        )
     except Exception:
         logger.exception("Geocode cache read failed for '%s'", address[:80])
         cached = None
+        cache_outcome = "cache_error"
 
     if cached:
         logger.info("Geocode cache hit for '%s'", address[:80])
-        return cached, None, None
+        return cached, None, None, cache_outcome
 
     geocode_result, error_reason, error_code = places_search_address(address)
 
@@ -96,7 +100,22 @@ def _geocode(address, lookup_address=None):
         except Exception:
             logger.exception("Geocode cache write failed for '%s'", address[:80])
 
-    return geocode_result, error_reason, error_code
+    return geocode_result, error_reason, error_code, cache_outcome
+
+
+def _new_drs_cache_counts(drs_no):
+    return {
+        "drsNo": drs_no,
+        "consignmentsProcessed": 0,
+        "invalidAddresses": 0,
+        "cacheLookups": 0,
+        "exactHits": 0,
+        "fuzzyHits": 0,
+        "misses": 0,
+        "cacheErrors": 0,
+        "apiCalls": 0,
+        "apiFailures": 0,
+    }
 
 
 def _dedupe(consignment_ids):
@@ -146,6 +165,7 @@ def save_consignments_pipeline(consignment_ids):
     docs, not_found_ids = get_consignments_by_id(deduped_ids)
 
     rows_to_merge = []
+    cache_metrics_by_drs = {}
     failures = [
         {"consignmentId": cid, "reason": "Consignment not found."}
         for cid in not_found_ids
@@ -163,10 +183,16 @@ def save_consignments_pipeline(consignment_ids):
         drs_no = str(data.get("drsNo") or "").strip()
         drs_id = str(data.get("drsId") or "").strip()
         driver_numeric_id = data.get("driverNumericId")
+        metric_drs_id = drs_id or "UNKNOWN"
+        drs_metrics = cache_metrics_by_drs.setdefault(
+            metric_drs_id, _new_drs_cache_counts(drs_no)
+        )
+        drs_metrics["consignmentsProcessed"] += 1
 
         geocode_address_str = build_geocode_address(receiver_name, receiver_address)
 
         if not geocode_address_str:
+            drs_metrics["invalidAddresses"] += 1
             reason = "Receiver address and name are both missing."
             failures.append({"consignmentId": consignment_id, "reason": reason})
             rows_to_merge.append(_failed_row(
@@ -175,14 +201,27 @@ def save_consignments_pipeline(consignment_ids):
             ))
             continue
 
-        geocode_result, error_reason, _error_code = _geocode(
+        geocode_result, error_reason, _error_code, cache_outcome = _geocode(
             geocode_address_str,
             lookup_address=receiver_address or None,
         )
+        drs_metrics["cacheLookups"] += 1
+        if cache_outcome == "exact_hit":
+            drs_metrics["exactHits"] += 1
+        elif cache_outcome == "fuzzy_hit":
+            drs_metrics["fuzzyHits"] += 1
+        elif cache_outcome == "miss":
+            drs_metrics["misses"] += 1
+        else:
+            drs_metrics["cacheErrors"] += 1
+
+        if cache_outcome not in ("exact_hit", "fuzzy_hit"):
+            drs_metrics["apiCalls"] += 1
         geocode_error = error_reason
         geocode_status = "success" if geocode_result else "failed"
 
         if geocode_result is None:
+            drs_metrics["apiFailures"] += 1
             logger.warning("Geocoding failed for consignment %s: %s", consignment_id, geocode_error)
             failures.append({"consignmentId": consignment_id, "reason": geocode_error})
             rows_to_merge.append(_failed_row(
@@ -221,6 +260,12 @@ def save_consignments_pipeline(consignment_ids):
         bq_rows = fetch_rows_by_consignment_ids([r["consignmentId"] for r in rows_to_merge])
         upsert_consignments_routing(bq_rows)
 
+    try:
+        write_drs_cache_metrics(cache_metrics_by_drs, start_dt)
+    except Exception:
+        # Analytics must never make the customer-facing save operation fail.
+        logger.exception("Failed to write DRS cache metrics")
+
     end_dt = datetime.now(timezone.utc)
     duration_seconds = round(time.perf_counter() - start_perf, 3)
     logger.info(
@@ -236,4 +281,24 @@ def save_consignments_pipeline(consignment_ids):
         "started_at": start_dt.isoformat(),
         "finished_at": end_dt.isoformat(),
         "duration_seconds": duration_seconds,
+        "cache_metrics": [
+            {
+                "drsId": drs_id,
+                "drsNo": counts["drsNo"],
+                "consignmentsProcessed": counts["consignmentsProcessed"],
+                "invalidAddresses": counts["invalidAddresses"],
+                "cacheLookups": counts["cacheLookups"],
+                "exactHits": counts["exactHits"],
+                "fuzzyHits": counts["fuzzyHits"],
+                "misses": counts["misses"],
+                "cacheErrors": counts["cacheErrors"],
+                "apiCalls": counts["apiCalls"],
+                "apiFailures": counts["apiFailures"],
+                "hitRate": round(
+                    ((counts["exactHits"] + counts["fuzzyHits"]) / counts["cacheLookups"]) * 100,
+                    2,
+                ) if counts["cacheLookups"] else 0.0,
+            }
+            for drs_id, counts in cache_metrics_by_drs.items()
+        ],
     }
