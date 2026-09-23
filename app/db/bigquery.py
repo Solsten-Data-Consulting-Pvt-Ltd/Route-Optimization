@@ -168,7 +168,8 @@ def fetch_active_rows_for_drs(drs_no):
             C.geohash_locality_loc,
             C.geohash_building_loc,
             C.geohash_exact_loc,
-            C.planned_sequence_order
+            C.planned_sequence_order,
+            C.actual_sequence_order
         FROM `{TABLE_REF}` AS C
         JOIN `{STRUCTURED_TABLE_REF}` AS S
             ON C.drsNo = S.drsNo
