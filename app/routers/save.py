@@ -34,7 +34,9 @@ def save_consignments(
         )
 
     try:
-        result = save_consignments_pipeline(consignment_ids)
+        result = save_consignments_pipeline(
+            consignment_ids, confirmed_locations=payload.confirmedLocations,
+        )
         status = "ok" if result["failed"] == 0 else "partial_success"
         return {"status": status, **result}
     except Exception as e:

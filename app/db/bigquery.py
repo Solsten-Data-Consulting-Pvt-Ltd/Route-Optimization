@@ -50,6 +50,9 @@ def _row_to_struct_param(row):
         bigquery.ScalarQueryParameter("country_code", "STRING", row["country_code"]),
         bigquery.ScalarQueryParameter("geocode_status", "STRING", row["geocode_status"]),
         bigquery.ScalarQueryParameter("geocode_error", "STRING", row["geocode_error"]),
+        bigquery.ScalarQueryParameter("locationOverridden", "BOOL", row["locationOverridden"]),
+        bigquery.ScalarQueryParameter("overriddenBy", "STRING", row["overriddenBy"]),
+        bigquery.ScalarQueryParameter("overriddenAt", "TIMESTAMP", row["overriddenAt"]),
     )
 
 
@@ -91,6 +94,9 @@ MERGE_SQL = f"""
         T.country_code = S.country_code,
         T.geocode_status = S.geocode_status,
         T.geocode_error = S.geocode_error,
+        T.locationOverridden = S.locationOverridden,
+        T.overriddenBy = S.overriddenBy,
+        T.overriddenAt = S.overriddenAt,
         T.updated_at = CURRENT_TIMESTAMP()
     WHEN NOT MATCHED THEN INSERT (
         sorting_id, drsNo, drsId, driverNumericId, consignmentId,
@@ -102,7 +108,9 @@ MERGE_SQL = f"""
         geocoding_source, exception_flag, is_commercial, is_active,
         formatted_address, place_id, location_type,
         street_number, route_name, district, state, country_code,
-        geocode_status, geocode_error, created_at, updated_at
+        geocode_status, geocode_error,
+        locationOverridden, overriddenBy, overriddenAt,
+        created_at, updated_at
     ) VALUES (
         GENERATE_UUID(), S.drsNo, S.drsId, S.driverNumericId, S.consignmentId,
         S.receiverAddress, S.receiverName, S.geocode_address, S.starting_address,
@@ -112,7 +120,9 @@ MERGE_SQL = f"""
         '{GEOCODING_SOURCE}', S.exception_flag, S.is_commercial, TRUE,
         S.formatted_address, S.place_id, S.location_type,
         S.street_number, S.route_name, S.district, S.state, S.country_code,
-        S.geocode_status, S.geocode_error, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+        S.geocode_status, S.geocode_error,
+        S.locationOverridden, S.overriddenBy, S.overriddenAt,
+        CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
     )
 """
 

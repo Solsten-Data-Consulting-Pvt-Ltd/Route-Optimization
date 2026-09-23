@@ -25,7 +25,8 @@ def build_row(drs_no, drs_id, driver_numeric_id, consignment_id, receiver_addres
               geocode_address_str, latitude, longitude, locality, area, geohash_exact, pincode,
               exception_flag, is_commercial, formatted_address=None, place_id=None, location_type=None,
               street_number=None, route_name=None, district=None, state=None, country_code=None,
-              geocode_status="success", geocode_error=None):
+              geocode_status="success", geocode_error=None,
+              location_overridden=False, overridden_by=None, overridden_at=None):
     """Build one row dict for BigQuery/Firestore."""
     return {
         "drsNo": drs_no,
@@ -58,6 +59,9 @@ def build_row(drs_no, drs_id, driver_numeric_id, consignment_id, receiver_addres
         "country_code": country_code,
         "geocode_status": geocode_status,
         "geocode_error": geocode_error,
+        "locationOverridden": bool(location_overridden),
+        "overriddenBy": overridden_by,
+        "overriddenAt": overridden_at,
     }
 
 
@@ -103,6 +107,39 @@ def _geocode(address, lookup_address=None):
     return geocode_result, error_reason, error_code, cache_outcome
 
 
+def preview_geocode(receiver_name, receiver_address):
+    """Cache-first, Places-on-miss lookup with no BigQuery/Firestore
+    consignments_routing side effects — used to show a pin before a
+    consignment is saved.
+
+    Normalises and builds the address exactly like save_consignments_pipeline's
+    per-row geocode step, so a preview and the eventual save agree. A fresh
+    Places hit is still written to geocode_cache by _geocode(), as today.
+    """
+    receiver_name = normalize_to_single_line(str(receiver_name or ""))
+    receiver_address = normalize_to_single_line(str(receiver_address or ""))
+
+    if not receiver_address:
+        return {"status": "failed", "error": "Receiver address is missing."}
+
+    geocode_address_str = build_geocode_address(receiver_name, receiver_address)
+
+    geocode_result, error_reason, _error_code, _cache_outcome = _geocode(
+        geocode_address_str, lookup_address=receiver_address or None,
+    )
+
+    if geocode_result is None:
+        return {"status": "failed", "error": error_reason}
+
+    return {
+        "status": "success",
+        "latitude": geocode_result["latitude"],
+        "longitude": geocode_result["longitude"],
+        "formatted_address": geocode_result.get("formatted_address"),
+        "exception_flag": derive_exception_flag(geocode_result),
+    }
+
+
 def _new_drs_cache_counts(drs_no):
     return {
         "drsNo": drs_no,
@@ -128,7 +165,7 @@ def _dedupe(consignment_ids):
     return deduped
 
 
-def save_consignments_pipeline(consignment_ids):
+def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
     """Fetch specific consignments by ID, geocode each, and insert-or-update
     (merge) them into BigQuery.
 
@@ -146,6 +183,11 @@ def save_consignments_pipeline(consignment_ids):
         string consistently resolves better/more precise lat/lon (e.g. it can
         disambiguate apartment/unit-level matches that a bare street address
         can't).
+
+    `confirmed_locations` (optional) maps consignmentId -> ConfirmedLocation.
+    For those consignments geocoding is skipped entirely and the executive's
+    point is persisted verbatim; cache metrics are not counted for them, since
+    no cache lookup or API call happens.
 
     Returns a summary dict including a `failures` list of
     {consignmentId, reason} so the frontend can show exactly which
@@ -201,22 +243,40 @@ def save_consignments_pipeline(consignment_ids):
             ))
             continue
 
-        geocode_result, error_reason, _error_code, cache_outcome = _geocode(
-            geocode_address_str,
-            lookup_address=receiver_address or None,
-        )
-        drs_metrics["cacheLookups"] += 1
-        if cache_outcome == "exact_hit":
-            drs_metrics["exactHits"] += 1
-        elif cache_outcome == "fuzzy_hit":
-            drs_metrics["fuzzyHits"] += 1
-        elif cache_outcome == "miss":
-            drs_metrics["misses"] += 1
-        else:
-            drs_metrics["cacheErrors"] += 1
+        confirmed = (confirmed_locations or {}).get(consignment_id)
 
-        if cache_outcome not in ("exact_hit", "fuzzy_hit"):
-            drs_metrics["apiCalls"] += 1
+        if confirmed:
+            # Executive already accepted/corrected this point on the map:
+            # persist it as-is, no cache lookup and no Places call. Metadata
+            # (locality, area, pincode, place_id, ...) is intentionally absent
+            # and degrades to build_row's defaults.
+            geocode_result = {
+                "latitude": confirmed.latitude,
+                "longitude": confirmed.longitude,
+                "formatted_address": confirmed.formatted_address,
+            }
+            error_reason = None
+            logger.info(
+                "Using executive-confirmed location for consignment %s (corrected=%s)",
+                consignment_id, confirmed.corrected,
+            )
+        else:
+            geocode_result, error_reason, _error_code, cache_outcome = _geocode(
+                geocode_address_str,
+                lookup_address=receiver_address or None,
+            )
+            drs_metrics["cacheLookups"] += 1
+            if cache_outcome == "exact_hit":
+                drs_metrics["exactHits"] += 1
+            elif cache_outcome == "fuzzy_hit":
+                drs_metrics["fuzzyHits"] += 1
+            elif cache_outcome == "miss":
+                drs_metrics["misses"] += 1
+            else:
+                drs_metrics["cacheErrors"] += 1
+
+            if cache_outcome not in ("exact_hit", "fuzzy_hit"):
+                drs_metrics["apiCalls"] += 1
         geocode_error = error_reason
         geocode_status = "success" if geocode_result else "failed"
 
@@ -252,6 +312,9 @@ def save_consignments_pipeline(consignment_ids):
             country_code=geocode_result.get("country_code"),
             geocode_status=geocode_status,
             geocode_error=geocode_error,
+            location_overridden=bool(confirmed and confirmed.corrected),
+            overridden_by=confirmed.overriddenBy if confirmed and confirmed.corrected else None,
+            overridden_at=datetime.now(timezone.utc) if confirmed and confirmed.corrected else None,
         ))
         saved_count += 1
 

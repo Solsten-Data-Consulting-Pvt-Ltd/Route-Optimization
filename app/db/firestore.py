@@ -104,6 +104,10 @@ def _base_routing_doc(row):
         "is_commercial": row.is_commercial,
         "is_active": row.is_active,
         "exception_flag": row.exception_flag,
+        # getattr: safe on rows fetched before the BigQuery columns exist.
+        "locationOverridden": bool(getattr(row, "locationOverridden", False) or False),
+        "overriddenBy": getattr(row, "overriddenBy", None),
+        "overriddenAt": _iso(getattr(row, "overriddenAt", None)),
         "created_at": _iso(getattr(row, "created_at", None)),
         "updated_at": _iso(getattr(row, "updated_at", None)),
     }
