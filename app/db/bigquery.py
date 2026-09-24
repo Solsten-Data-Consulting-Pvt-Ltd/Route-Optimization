@@ -53,13 +53,17 @@ def _row_to_struct_param(row):
         bigquery.ScalarQueryParameter("locationOverridden", "BOOL", row["locationOverridden"]),
         bigquery.ScalarQueryParameter("overriddenBy", "STRING", row["overriddenBy"]),
         bigquery.ScalarQueryParameter("overriddenAt", "TIMESTAMP", row["overriddenAt"]),
+        bigquery.ScalarQueryParameter("planned_latitude", "FLOAT64", row["planned_latitude"]),
+        bigquery.ScalarQueryParameter("planned_longitude", "FLOAT64", row["planned_longitude"]),
     )
 
 
 # MATCHED (consignment already in BQ): updates address/geocode fields only.
 # sorting_id, geohash_group_id and the planned_*/actual_* sequence fields are
 # left untouched so an already-routed consignment doesn't get silently
-# un-grouped by a later re-save.
+# un-grouped by a later re-save. planned_latitude/planned_longitude (the
+# FIRST point this consignment ever resolved to) are excluded from the
+# UPDATE branch for the same reason — set once on insert, frozen after.
 # NOT MATCHED (new consignment): inserts a fresh row with a generated
 # sorting_id and geohash_group_id = 'UNASSIGNED', ready for run_sorting.
 MERGE_SQL = f"""
@@ -110,6 +114,7 @@ MERGE_SQL = f"""
         street_number, route_name, district, state, country_code,
         geocode_status, geocode_error,
         locationOverridden, overriddenBy, overriddenAt,
+        planned_latitude, planned_longitude,
         created_at, updated_at
     ) VALUES (
         GENERATE_UUID(), S.drsNo, S.drsId, S.driverNumericId, S.consignmentId,
@@ -122,6 +127,7 @@ MERGE_SQL = f"""
         S.street_number, S.route_name, S.district, S.state, S.country_code,
         S.geocode_status, S.geocode_error,
         S.locationOverridden, S.overriddenBy, S.overriddenAt,
+        S.planned_latitude, S.planned_longitude,
         CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
     )
 """

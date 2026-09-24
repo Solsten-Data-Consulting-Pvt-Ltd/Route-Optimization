@@ -26,8 +26,18 @@ def build_row(drs_no, drs_id, driver_numeric_id, consignment_id, receiver_addres
               exception_flag, is_commercial, formatted_address=None, place_id=None, location_type=None,
               street_number=None, route_name=None, district=None, state=None, country_code=None,
               geocode_status="success", geocode_error=None,
-              location_overridden=False, overridden_by=None, overridden_at=None):
-    """Build one row dict for BigQuery/Firestore."""
+              location_overridden=False, overridden_by=None, overridden_at=None,
+              planned_latitude=None, planned_longitude=None):
+    """Build one row dict for BigQuery/Firestore.
+
+    planned_latitude/planned_longitude are the FIRST point this consignment
+    ever resolved to (auto-geocode or a very first manual placement) — the
+    BigQuery MERGE (see db/bigquery.py's MERGE_SQL) deliberately excludes
+    these two columns from its UPDATE branch, so whatever value is passed
+    here is only ever actually stored once, on that first INSERT, and is
+    silently ignored on every later save/correction. `latitude`/`longitude`
+    above remain the CURRENT point, updated on every save as before.
+    """
     return {
         "drsNo": drs_no,
         "drsId": drs_id,
@@ -62,6 +72,8 @@ def build_row(drs_no, drs_id, driver_numeric_id, consignment_id, receiver_addres
         "locationOverridden": bool(location_overridden),
         "overriddenBy": overridden_by,
         "overriddenAt": overridden_at,
+        "planned_latitude": planned_latitude,
+        "planned_longitude": planned_longitude,
     }
 
 
@@ -315,6 +327,11 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
             location_overridden=bool(confirmed and confirmed.corrected),
             overridden_by=confirmed.overriddenBy if confirmed and confirmed.corrected else None,
             overridden_at=datetime.now(timezone.utc) if confirmed and confirmed.corrected else None,
+            # Whatever this save resolved to, in case this turns out to be
+            # this consignment's first-ever row (see build_row's docstring)
+            # — ignored by the MERGE on every subsequent save.
+            planned_latitude=geocode_result["latitude"],
+            planned_longitude=geocode_result["longitude"],
         ))
         saved_count += 1
 

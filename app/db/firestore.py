@@ -108,6 +108,12 @@ def _base_routing_doc(row):
         "locationOverridden": bool(getattr(row, "locationOverridden", False) or False),
         "overriddenBy": getattr(row, "overriddenBy", None),
         "overriddenAt": _iso(getattr(row, "overriddenAt", None)),
+        # The frozen first-ever point for this consignment (see
+        # services/save.py::build_row's docstring) — getattr-guarded same as
+        # the override fields above, safe on rows fetched before these
+        # BigQuery columns existed.
+        "plannedLatitude": getattr(row, "planned_latitude", None),
+        "plannedLongitude": getattr(row, "planned_longitude", None),
         "created_at": _iso(getattr(row, "created_at", None)),
         "updated_at": _iso(getattr(row, "updated_at", None)),
     }
