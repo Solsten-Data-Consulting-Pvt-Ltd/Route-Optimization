@@ -176,13 +176,23 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
     geocode_result, error_reason, error_code = places_search_address(address)
 
     if geocode_result:
-        group = drs_memo.group_id(drs_id, match_info["entry_id"]) if use_memo else None
-        try:
-            save_to_cache(address, geocode_result, lookup_address=lookup_address,
-                          drs_memo_group=group)
-        except Exception:
-            logger.exception("Geocode cache write failed for '%s'", address[:80])
+        # Only persist to geocode_cache when there's a real DRS/memo context
+        # (use_memo). Without a drs_id there's no drs_memo_group to tag this
+        # row with, so it would sit forever as an untagged orphan - and once
+        # this same consignment is later actually added to a DRS and
+        # geocoded again through the memo-aware path (or a same-place
+        # sibling triggers the group first), that write can never find or
+        # fold in this earlier one, since geocode_cache has no phone/door
+        # number matching of its own - only exact/near-identical text. A
+        # preview before a consignment has a DRS just re-hits Places on
+        # every repeat instead of caching; that's the accepted trade-off.
         if use_memo:
+            group = drs_memo.group_id(drs_id, match_info["entry_id"])
+            try:
+                save_to_cache(address, geocode_result, lookup_address=lookup_address,
+                              drs_memo_group=group)
+            except Exception:
+                logger.exception("Geocode cache write failed for '%s'", address[:80])
             _safe(drs_memo.remember, drs_id, match_info, geocode_result, drs_memo.SOURCE_API,
                   lookup_address=lookup_address, consignment_id=consignment_id,
                   entries=memo_entries)

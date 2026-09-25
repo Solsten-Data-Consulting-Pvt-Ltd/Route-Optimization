@@ -351,8 +351,23 @@ def save_to_cache(
         # could ever do.
         siblings = _docs_by_group(drs_memo_group)
         if siblings:
+            # address_normalized/address_raw/geocode_address_raw are left
+            # OUT of this update on purpose. A Firestore document's id is
+            # fixed at creation - here, cache_key() of whichever spelling
+            # this doc was FIRST written under - and can never change to
+            # match a later spelling. Overwriting the scalar
+            # address_normalized field to this spelling's text would make
+            # it claim an id it doesn't actually have, so a later, ungrouped
+            # write for that exact same text (see _exact_lookup/save below)
+            # would compute cache_key() of it, find nothing at THAT id, and
+            # wrongly create a duplicate doc instead of finding this one.
+            # Only the array (which _exact_lookup also checks) is grown.
+            sibling_payload = {
+                k: v for k, v in payload.items()
+                if k not in ("address_normalized", "address_raw", "geocode_address_raw")
+            }
             siblings[0].reference.update({
-                **payload,
+                **sibling_payload,
                 "address_normalized_variants": firestore.ArrayUnion([normalized]),
             })
             return
@@ -362,6 +377,28 @@ def save_to_cache(
     # payload is refreshed.
     if doc_ref.get().exists:
         doc_ref.update(payload)
+        return
+
+    # This exact spelling has no doc of its own - but it may already be a
+    # recorded VARIANT of another doc (absorbed there under a drs_memo_group
+    # by an earlier write, possibly one this call has no group for - e.g. a
+    # DRS-unaware preview geocode running after a grouped save already
+    # claimed this text). That other doc's real id is whatever ITS first
+    # spelling hashed to, which is never `cache_key(normalized)` for a
+    # variant spelling - so without this check, every such write would
+    # wrongly create a fresh duplicate here every single time.
+    variant_matches = list(
+        _collection()
+        .where("address_normalized_variants", "array_contains", normalized)
+        .limit(1)
+        .stream()
+    )
+    if variant_matches:
+        sibling_payload = {
+            k: v for k, v in payload.items()
+            if k not in ("address_normalized", "address_raw", "geocode_address_raw")
+        }
+        variant_matches[0].reference.update(sibling_payload)
         return
 
     doc_ref.set({
