@@ -6,6 +6,11 @@ from pydantic import BaseModel, Field, model_validator
 class GeocodePreviewRequest(BaseModel):
     receiverName: Optional[str] = None
     receiverAddress: str
+    # Optional: lets the preview reuse a pin already resolved for the same
+    # receiver/place in this DRS. With consignmentId the backend reads
+    # receiver.phone / fullAddress from the consignment itself.
+    drsId: Optional[str] = None
+    consignmentId: Optional[str] = None
 
 
 class ConfirmedLocation(BaseModel):

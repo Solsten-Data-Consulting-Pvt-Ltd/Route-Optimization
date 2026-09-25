@@ -10,8 +10,10 @@ from app.config import GEOHASH_BUILDING_LEN, GEOHASH_LOCALITY_LEN, GOOGLE_MAPS_A
 from app.db.bigquery import fetch_rows_by_consignment_ids, merge_routing_rows
 from app.db.cache_metrics import write_drs_cache_metrics
 from app.db.firestore import get_consignments_by_id, upsert_consignments_routing
+from app.db import drs_memo
 from app.db.geocache import get_cached_geocode_with_outcome, save_to_cache
 from app.services.address import build_geocode_address, normalize_to_single_line
+from app.services.address_match import consignment_match_info, match_info_from_address
 from app.services.geocoding import (
     derive_exception_flag,
     derive_is_commercial,
@@ -77,12 +79,64 @@ def _failed_row(drs_no, drs_id, driver_numeric_id, consignment_id,
     )
 
 
-def _geocode(address, lookup_address=None):
-    """Cache first, Places on a miss. A cache failure never fails the save.
+def _safe(fn, *args, **kwargs):
+    """Run a cache/memo side effect; never let it fail the geocode."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        logger.exception("%s failed", getattr(fn, "__name__", "side effect"))
+        return None
+
+
+def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignment_id):
+    result = drs_memo.result_from_entry(entry, address)
+    logger.info("DRS memo hit (%s, source=%s) drs=%s for '%s'",
+                reason, entry.get("source"), drs_id, address[:80])
+    _safe(drs_memo.link, drs_id, entry_id,
+          lookup_address=lookup_address, consignment_id=consignment_id)
+    # A new spelling of this place: give it its own (unverified) geocode_cache
+    # entry in the same group, so verifying the group at end of DRS makes
+    # this spelling servable from the global cache tomorrow.
+    if lookup_address and lookup_address not in (entry.get("variants") or []):
+        _safe(save_to_cache, address, result, lookup_address=lookup_address,
+              source="drs_memo", drs_memo_group=drs_memo.group_id(drs_id, entry_id))
+    return result, None, None, "drs_hit"
+
+
+def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
+             consignment_id=None):
+    """Resolve a pin. Order:
+
+      1. DRS memo, executive-corrected entries only (a correction made in this
+         DRS today is the newest human decision)
+      2. verified geocode_cache (addresses verified at end of earlier DRSs)
+      3. DRS memo, any entry (same receiver/place geocoded earlier in this DRS)
+      4. Places API
+
+    Steps 1 and 3 run only when `drs_id` and `match_info` are given; without
+    them this behaves exactly as before. A cache or memo failure never fails
+    the geocode.
 
     Fix 1 — `lookup_address` (receiver_address without name prefix) is
     forwarded to the cache functions so that the cache key is location-only.
     """
+    use_memo = bool(drs_id and match_info and match_info.get("entry_id"))
+    memo_entries = {}
+    if use_memo:
+        try:
+            memo_entries = drs_memo.load_entries(drs_id)
+        except Exception:
+            logger.exception("DRS memo read failed for drs=%s", drs_id)
+            use_memo = False
+
+    # 1. Executive correction made in this DRS.
+    if use_memo:
+        hit = drs_memo.find_match(memo_entries, match_info,
+                                  sources={drs_memo.SOURCE_EXEC_CORRECTED})
+        if hit:
+            return _memo_hit(drs_id, *hit, address, lookup_address, consignment_id)
+
+    # 2. Verified global cache.
     try:
         cached, cache_outcome = get_cached_geocode_with_outcome(
             address, lookup_address=lookup_address
@@ -94,20 +148,61 @@ def _geocode(address, lookup_address=None):
 
     if cached:
         logger.info("Geocode cache hit for '%s'", address[:80])
+        if use_memo:
+            _safe(drs_memo.remember, drs_id, match_info, cached, drs_memo.SOURCE_GLOBAL_CACHE,
+                  lookup_address=lookup_address, consignment_id=consignment_id,
+                  entries=memo_entries)
         return cached, None, None, cache_outcome
 
+    # 3. Same place already resolved earlier in this DRS.
+    if use_memo:
+        hit = drs_memo.find_match(memo_entries, match_info)
+        if hit:
+            return _memo_hit(drs_id, *hit, address, lookup_address, consignment_id)
+
+    # 4. Places.
     geocode_result, error_reason, error_code = places_search_address(address)
 
     if geocode_result:
+        group = drs_memo.group_id(drs_id, match_info["entry_id"]) if use_memo else None
         try:
-            save_to_cache(address, geocode_result, lookup_address=lookup_address)
+            save_to_cache(address, geocode_result, lookup_address=lookup_address,
+                          drs_memo_group=group)
         except Exception:
             logger.exception("Geocode cache write failed for '%s'", address[:80])
+        if use_memo:
+            _safe(drs_memo.remember, drs_id, match_info, geocode_result, drs_memo.SOURCE_API,
+                  lookup_address=lookup_address, consignment_id=consignment_id,
+                  entries=memo_entries)
 
     return geocode_result, error_reason, error_code, cache_outcome
 
 
-def preview_geocode(receiver_name, receiver_address):
+def _preview_match_context(receiver_address, drs_id, consignment_id):
+    """(drs_id, match_info) for a scan preview.
+
+    With a consignmentId the consignment document supplies receiver.phone,
+    receiver.fullAddress and addressComponent (and drsId, if not given). With
+    only a drsId the scanned address text is used. With neither, the DRS memo
+    is skipped.
+    """
+    if consignment_id:
+        try:
+            docs, _missing = get_consignments_by_id([consignment_id])
+        except Exception:
+            logger.exception("Preview: consignment lookup failed for %s", consignment_id)
+            docs = []
+        if docs:
+            data = docs[0].to_dict() or {}
+            drs_id = (drs_id or str(data.get("drsId") or "").strip()
+                      or str(data.get("drsNo") or "").strip() or None)
+            return drs_id, consignment_match_info(data.get("receiver") or {})
+    if drs_id:
+        return drs_id, match_info_from_address(receiver_address)
+    return None, None
+
+
+def preview_geocode(receiver_name, receiver_address, drs_id=None, consignment_id=None):
     """Cache-first, Places-on-miss lookup with no BigQuery/Firestore
     consignments_routing side effects — used to show a pin before a
     consignment is saved.
@@ -124,8 +219,13 @@ def preview_geocode(receiver_name, receiver_address):
 
     geocode_address_str = build_geocode_address(receiver_name, receiver_address)
 
+    memo_drs_id, match_info = _preview_match_context(
+        receiver_address, (drs_id or "").strip() or None, (consignment_id or "").strip() or None,
+    )
+
     geocode_result, error_reason, _error_code, _cache_outcome = _geocode(
         geocode_address_str, lookup_address=receiver_address or None,
+        drs_id=memo_drs_id, match_info=match_info, consignment_id=consignment_id or None,
     )
 
     if geocode_result is None:
@@ -148,6 +248,7 @@ def _new_drs_cache_counts(drs_no):
         "cacheLookups": 0,
         "exactHits": 0,
         "fuzzyHits": 0,
+        "drsHits": 0,
         "misses": 0,
         "cacheErrors": 0,
         "apiCalls": 0,
@@ -230,6 +331,8 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
             metric_drs_id, _new_drs_cache_counts(drs_no)
         )
         drs_metrics["consignmentsProcessed"] += 1
+        memo_drs_id = drs_id or drs_no or None
+        match_info = consignment_match_info(receiver)
 
         geocode_address_str = build_geocode_address(receiver_name, receiver_address)
 
@@ -260,22 +363,37 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                 "Using executive-confirmed location for consignment %s (corrected=%s)",
                 consignment_id, confirmed.corrected,
             )
+            # Share the confirmed pin with same-place consignments later in
+            # this DRS. A correction outranks even the verified cache.
+            if memo_drs_id:
+                _safe(
+                    drs_memo.remember, memo_drs_id, match_info, geocode_result,
+                    drs_memo.SOURCE_EXEC_CORRECTED if confirmed.corrected
+                    else drs_memo.SOURCE_EXEC_ACCEPTED,
+                    lookup_address=receiver_address or None,
+                    consignment_id=consignment_id,
+                )
         else:
             geocode_result, error_reason, _error_code, cache_outcome = _geocode(
                 geocode_address_str,
                 lookup_address=receiver_address or None,
+                drs_id=memo_drs_id,
+                match_info=match_info,
+                consignment_id=consignment_id,
             )
             drs_metrics["cacheLookups"] += 1
             if cache_outcome == "exact_hit":
                 drs_metrics["exactHits"] += 1
             elif cache_outcome == "fuzzy_hit":
                 drs_metrics["fuzzyHits"] += 1
+            elif cache_outcome == "drs_hit":
+                drs_metrics["drsHits"] += 1
             elif cache_outcome == "miss":
                 drs_metrics["misses"] += 1
             else:
                 drs_metrics["cacheErrors"] += 1
 
-            if cache_outcome not in ("exact_hit", "fuzzy_hit"):
+            if cache_outcome not in ("exact_hit", "fuzzy_hit", "drs_hit"):
                 drs_metrics["apiCalls"] += 1
         geocode_error = error_reason
         geocode_status = "success" if geocode_result else "failed"
@@ -353,6 +471,7 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                 "cacheLookups": counts["cacheLookups"],
                 "exactHits": counts["exactHits"],
                 "fuzzyHits": counts["fuzzyHits"],
+                "drsHits": counts["drsHits"],
                 "misses": counts["misses"],
                 "cacheErrors": counts["cacheErrors"],
                 "apiCalls": counts["apiCalls"],

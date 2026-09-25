@@ -43,6 +43,7 @@ def write_drs_cache_metrics(
             "cacheLookups": lookups,
             "exactHits": counts["exactHits"],
             "fuzzyHits": counts["fuzzyHits"],
+            "drsHits": counts.get("drsHits", 0),
             "misses": counts["misses"],
             "cacheErrors": counts["cacheErrors"],
             "apiCalls": counts["apiCalls"],

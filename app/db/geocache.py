@@ -283,6 +283,8 @@ def save_to_cache(
     address: str,
     geocode_result: dict,
     lookup_address: Optional[str] = None,
+    source: str = "api",
+    drs_memo_group: Optional[str] = None,
 ) -> None:
     """Persist a geocode result to the cache.
 
@@ -294,6 +296,11 @@ def save_to_cache(
     `geocode_address_raw` for traceability.
 
     If `lookup_address` is omitted the behaviour is identical to before.
+
+    `source` is "api" for a fresh Places result or "drs_memo" when the pin was
+    reused from another consignment in the same DRS. `drs_memo_group` links
+    all address variants that share one DRS-memo pin, so end-of-day
+    verification can verify them together (see `verify_cache_group`).
     """
     key_str = lookup_address if lookup_address else address
     normalized = normalize_address(key_str)
@@ -307,9 +314,11 @@ def save_to_cache(
         "address_raw":         address,     # full geocode string (name + address)
         "geocode_address_raw": address,     # alias kept for clarity
         "address_normalized":  normalized,  # Fix 1: keyed on location only
-        "source": "api",
+        "source": source,
         "updated_at": firestore.SERVER_TIMESTAMP,
     })
+    if drs_memo_group:
+        payload["drs_memo_group"] = drs_memo_group
 
     doc_ref = _collection().document(cache_key(normalized))
     # An existing entry keeps its ops verdict and hit count; only the geocode
@@ -327,3 +336,28 @@ def save_to_cache(
         "created_at": firestore.SERVER_TIMESTAMP,
     })
 
+
+def verify_cache_group(drs_memo_group: str, verified_by: str) -> int:
+    """Mark every geocode_cache entry in one DRS-memo group as verified.
+
+    For the end-of-DRS verification step: when an executive verifies one
+    address, the other spellings of it seen in the same DRS (which reused its
+    pin via the DRS memo) become servable too. Returns the number updated.
+    """
+    if not drs_memo_group:
+        return 0
+    docs = list(
+        _collection().where("drs_memo_group", "==", drs_memo_group).stream()
+    )
+    if not docs:
+        return 0
+    batch = get_fs_client().batch()
+    for doc in docs:
+        batch.update(doc.reference, {
+            "verified": True,
+            "verified_by": verified_by,
+            "verified_at": firestore.SERVER_TIMESTAMP,
+        })
+    batch.commit()
+    invalidate_snapshot()
+    return len(docs)

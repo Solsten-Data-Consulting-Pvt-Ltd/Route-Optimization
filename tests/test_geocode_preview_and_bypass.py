@@ -88,7 +88,8 @@ class SaveBypassTests(unittest.TestCase):
              patch.object(save_mod, "merge_routing_rows") as merge, \
              patch.object(save_mod, "fetch_rows_by_consignment_ids", return_value=[]), \
              patch.object(save_mod, "upsert_consignments_routing"), \
-             patch.object(save_mod, "write_drs_cache_metrics"):
+             patch.object(save_mod, "write_drs_cache_metrics"), \
+             patch.object(save_mod.drs_memo, "remember"):
             result = save_mod.save_consignments_pipeline(
                 list(ids), confirmed_locations=confirmed_locations)
         rows = {r["consignmentId"]: r for r in merge.call_args.args[0]}
