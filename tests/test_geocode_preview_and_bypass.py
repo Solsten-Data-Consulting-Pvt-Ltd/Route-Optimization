@@ -19,7 +19,7 @@ os.environ.setdefault("FIRESTORE_PROJECT", "test-project")
 from pydantic import ValidationError
 
 from app.db.bigquery import MERGE_SQL, _row_to_struct_param
-from app.db.firestore import _base_routing_doc
+from app.db.firestore import _base_routing_doc, _save_routing_doc
 from app.schemas import ConfirmedLocation, SaveConsignmentsRequest
 from app.services import save as save_mod
 
@@ -182,7 +182,11 @@ class PersistenceTests(unittest.TestCase):
             self.assertIn(f"T.{col} = S.{col}", MERGE_SQL)
             self.assertIn(f"S.{col}", MERGE_SQL.split("VALUES", 1)[1])
 
-    def test_firestore_doc_tolerates_rows_without_new_columns(self):
+    def test_save_doc_tolerates_rows_without_new_columns(self):
+        # _save_routing_doc (post-save Firestore sync) is the sole owner of
+        # the location/override fields — see
+        # test_sort_doc_never_writes_location_or_override_fields below for
+        # why the sort pipeline must never see these keys at all.
         fields = ["sorting_id", "drsNo", "drsId", "driverNumericId", "consignmentId",
                   "receiverAddress", "receiverName", "starting_address", "starting_latitude",
                   "starting_longitude", "latitude", "longitude", "locality", "area",
@@ -191,13 +195,55 @@ class PersistenceTests(unittest.TestCase):
                   "planned_sequence_order", "actual_inside_cluster_sequence",
                   "actual_sequence_order", "is_commercial", "is_active", "exception_flag"]
         old_row = SimpleNamespace(**{f: None for f in fields})
-        doc = _base_routing_doc(old_row)
+        doc = _save_routing_doc(old_row)
         self.assertEqual((doc["locationOverridden"], doc["overriddenBy"], doc["overriddenAt"]),
                          (False, None, None))
         new_row = SimpleNamespace(**{f: None for f in fields}, locationOverridden=True,
                                   overriddenBy="E1", overriddenAt=datetime(2026, 9, 23, 5, 0))
-        doc = _base_routing_doc(new_row)
+        doc = _save_routing_doc(new_row)
         self.assertEqual(doc["overriddenAt"], "2026-09-23T05:00:00")
+
+    def test_sort_doc_never_writes_location_or_override_fields(self):
+        # Regression test: run_sorting_pipeline (Optimize Route) re-syncs
+        # Firestore from whatever BigQuery currently holds for the DRS, with
+        # no idea whether a manual pin correction landed more recently than
+        # that BigQuery row. Previously _base_routing_doc (which
+        # upsert_routing_from_sorting/the sort pipeline writes with
+        # merge=True) always included latitude/longitude/locationOverridden/
+        # overriddenBy/overriddenAt/plannedLatitude/plannedLongitude, so
+        # every Optimize Route run silently overwrote — and could revert —
+        # a correction the save pipeline had already applied. These fields
+        # must never appear in the sort pipeline's doc at all: a merge write
+        # only ever touches the keys present in it.
+        fields = ["sorting_id", "drsNo", "drsId", "driverNumericId", "consignmentId",
+                  "receiverAddress", "receiverName", "starting_address", "starting_latitude",
+                  "starting_longitude", "latitude", "longitude", "locality", "area",
+                  "geohash_locality_loc", "geohash_building_loc", "geohash_exact_loc",
+                  "pincode", "geohash_group_id", "planned_inside_cluster_sequence",
+                  "planned_sequence_order", "actual_inside_cluster_sequence",
+                  "actual_sequence_order", "is_commercial", "is_active", "exception_flag",
+                  "planned_latitude", "planned_longitude", "locationOverridden",
+                  "overriddenBy", "overriddenAt"]
+        row = SimpleNamespace(**{f: None for f in fields})
+        row.latitude = 12.899810224435797
+        row.longitude = 77.71012834805742
+        row.locationOverridden = True
+        row.overriddenBy = "E1"
+        row.overriddenAt = datetime(2026, 9, 23, 5, 0)
+        row.planned_latitude = 12.8825751
+        row.planned_longitude = 77.6040827
+
+        doc = _base_routing_doc(row)
+
+        for forbidden in ("latitude", "longitude", "locationOverridden", "overriddenBy",
+                          "overriddenAt", "plannedLatitude", "plannedLongitude"):
+            self.assertNotIn(
+                forbidden, doc,
+                f"_base_routing_doc must not write {forbidden!r} — the sort "
+                "pipeline has no idea whether a save-pipeline correction is "
+                "more recent than the BigQuery row it read, so writing this "
+                "key (even via a merge write) can silently revert one.",
+            )
 
 
 class RouterTests(unittest.TestCase):
