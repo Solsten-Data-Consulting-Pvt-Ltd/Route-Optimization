@@ -383,14 +383,32 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
             # cache; a plain acceptance defers to any entry at least as
             # trustworthy, and geocode_result is replaced with that entry's
             # pin so the saved row agrees with it.
+            confirmed_source = (
+                drs_memo.SOURCE_EXEC_CORRECTED if confirmed.corrected
+                else drs_memo.SOURCE_EXEC_ACCEPTED
+            )
             if memo_drs_id:
                 geocode_result, _memo_entry_id = _safe(
                     drs_memo.reconcile, memo_drs_id, match_info, geocode_result,
-                    drs_memo.SOURCE_EXEC_CORRECTED if confirmed.corrected
-                    else drs_memo.SOURCE_EXEC_ACCEPTED,
+                    confirmed_source,
                     lookup_address=receiver_address or None,
                     consignment_id=consignment_id,
                 ) or (geocode_result, None)
+                # Feed this spelling into geocode_cache too - same as the
+                # auto-geocode path already does (see _geocode's step 4 and
+                # _memo_hit) - so a confirmed/corrected save also teaches the
+                # global cache instead of only ever updating the DRS memo.
+                # save_to_cache() is idempotent per normalized address text
+                # (its Firestore doc id is a hash of that text), so this is
+                # safe to call unconditionally - it updates the existing row
+                # if this exact spelling was already cached, never doubles it.
+                if _memo_entry_id:
+                    _safe(
+                        save_to_cache, geocode_address_str, geocode_result,
+                        lookup_address=receiver_address or None,
+                        source=confirmed_source,
+                        drs_memo_group=drs_memo.group_id(memo_drs_id, _memo_entry_id),
+                    )
         else:
             geocode_result, error_reason, _error_code, cache_outcome = _geocode(
                 geocode_address_str,
