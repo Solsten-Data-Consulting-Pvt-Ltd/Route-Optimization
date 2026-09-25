@@ -187,6 +187,19 @@ def _exact_lookup(normalized: str):
         .limit(1)
         .stream()
     )
+    if docs:
+        return docs[0].id, (docs[0].to_dict() or {})
+
+    # A consolidated multi-spelling entry (see save_to_cache's drs_memo_group
+    # reuse below) stores every OTHER spelling it has absorbed here, since
+    # its own address_normalized only ever holds the first/canonical one.
+    docs = list(
+        _collection()
+        .where("address_normalized_variants", "array_contains", normalized)
+        .where("verified", "==", True)
+        .limit(1)
+        .stream()
+    )
     if not docs:
         return None
     return docs[0].id, (docs[0].to_dict() or {})
@@ -279,6 +292,14 @@ def get_cached_geocode(
     return result
 
 
+def _docs_by_group(drs_memo_group: str):
+    """Every geocode_cache doc already tagged with this drs_memo_group -
+    normally 0 (first spelling of a new place) or 1 (every later spelling
+    of a place the DRS memo already resolved earlier today reuses that same
+    doc instead of writing its own)."""
+    return list(_collection().where("drs_memo_group", "==", drs_memo_group).stream())
+
+
 def save_to_cache(
     address: str,
     geocode_result: dict,
@@ -320,6 +341,22 @@ def save_to_cache(
     if drs_memo_group:
         payload["drs_memo_group"] = drs_memo_group
 
+        # Reuse a sibling entry the DRS memo already tagged with this same
+        # group (see drs_memo.py & address_match.py::drs_match - it can
+        # match two spellings that don't even look similar as text, e.g. via
+        # a shared phone number) rather than writing yet another row keyed
+        # on this spelling's own hash. The group is a cheaper, already-made
+        # "same place" decision - this doesn't need to re-derive it from
+        # text similarity, which is all cache_key()/_fuzzy_lookup() alone
+        # could ever do.
+        siblings = _docs_by_group(drs_memo_group)
+        if siblings:
+            siblings[0].reference.update({
+                **payload,
+                "address_normalized_variants": firestore.ArrayUnion([normalized]),
+            })
+            return
+
     doc_ref = _collection().document(cache_key(normalized))
     # An existing entry keeps its ops verdict and hit count; only the geocode
     # payload is refreshed.
@@ -329,6 +366,7 @@ def save_to_cache(
 
     doc_ref.set({
         **payload,
+        "address_normalized_variants": [normalized],
         "verified": False,
         "verified_by": None,
         "verified_at": None,
