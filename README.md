@@ -26,7 +26,10 @@ You give it a list of consignment IDs. For each one it:
 3. Looks that address up in the **geocode cache** (Firestore `geocode_cache`).
    If the same (or a very similar) address was geocoded before *and* an ops
    person marked it `verified`, it reuses that answer and skips the API call.
-4. On a cache miss, calls the **Google Places API** to get latitude, longitude,
+   Before and after this step it checks the **DRS address memo** — pins
+   already resolved for the same receiver/place earlier in this DRS (see
+   [DRS address memo](#drs-address-memo)).
+4. On a miss everywhere, calls the **Google Places API** to get latitude, longitude,
    pincode, locality, area and so on. The new result is written back into the
    cache as `verified: false`, so it is stored but not yet trusted for reuse.
 5. Turns the coordinates into geohashes at three precisions — exact (8),
@@ -110,6 +113,53 @@ run-sorting again   ->  delivered stops stay put, the rest are re-optimized
 
 ---
 
+## DRS address memo
+
+Executives verify `geocode_cache` entries only at the end of a DRS, so during
+the day a second parcel to the same receiver misses the cache and would call
+Places again (and may get a slightly different pin). The memo closes that gap.
+
+**Lookup order** (`_geocode` in `app/services/save.py`):
+
+| Step | Source | Notes |
+|------|--------|-------|
+| 0 | `confirmedLocations` on save | As before; the confirmed pin is also written to the memo |
+| 1 | Memo — executive-**corrected** entries | A correction made in this DRS today beats everything |
+| 2 | Verified `geocode_cache` | Addresses verified at the end of earlier DRSs |
+| 3 | Memo — any entry | Same receiver/place resolved earlier in this DRS |
+| 4 | Places API | Result is saved to `geocode_cache` and the memo |
+
+**When two consignments count as the same place** (`app/services/address_match.py`),
+using `receiver.fullAddress` (falls back to `receiver.address`),
+`receiver.phone` and `receiver.addressComponent`:
+
+1. Different pincode → never.
+2. Same `receiver.phone` → yes, unless both have door numbers and they differ.
+   Only `receiver.phone` is used; numbers inside the address text are ignored.
+3. Either address road-level (no door number, fewer than 3 distinctive words,
+   e.g. OCR text "Kodathi Village Main Road, Kodathi Gate, Bangalore …") → no
+   text match.
+4. Door numbers identical, and the texts are equal, one contains the other
+   (≥ 90 % of the shorter one's words), or `token_sort_ratio` ≥ 90.
+
+Thresholds are in `app/config.py` (`DRS_MEMO_*`).
+
+**End-of-DRS verification.** When a memo pin is reused under a new spelling,
+that spelling gets its own unverified `geocode_cache` entry with the same pin
+and a `drs_memo_group` field. `app.db.geocache.verify_cache_group(group, by)`
+verifies every spelling in a group at once, so all of them are served from
+the cache the next day.
+
+**Scan preview.** `POST /geocode/preview` accepts optional `drsId` and
+`consignmentId`. With `consignmentId` the backend reads phone / fullAddress
+from the consignment itself; without either, the memo is skipped.
+
+**One-time setup.** Enable a Firestore TTL policy on collection
+`drs_address_memo`, field `expires_at` (entries live `DRS_MEMO_TTL_DAYS` = 2
+days).
+
+---
+
 ## Endpoints
 
 | Method | Path | Purpose |
@@ -188,6 +238,7 @@ a `message` is returned.
 |-------|--------------|-----|
 | Firestore `consignments` | read | Source consignment documents (receiver name and address) |
 | Firestore `geocode_cache` | read + write | Previously geocoded addresses. Only entries flagged `verified: true` are reused; new entries are stored as `verified: false` |
+| Firestore `drs_address_memo` | read + write | One document per DRS: pins already resolved in that DRS, reused for later same-place consignments. Needs a TTL policy on `expires_at` |
 | Firestore `drs_cache_metrics` | write | One aggregate cache summary per DRS save run: exact/fuzzy hits, misses, API calls, and hit rate. This is written after the routing save and never blocks it. |
 | Firestore `drs_starting_point` | read | Hub/depot lat/lon and address, keyed by DRS number |
 | Firestore `consignments_routing` | write | Mirror of the BigQuery row, written after both pipelines, so the app can read it |

@@ -15,7 +15,10 @@ def geocode_preview(payload: GeocodePreviewRequest):
     BigQuery or consignments_routing. Always 200; failures come back as
     {"status": "failed", "error": ...}."""
     try:
-        return preview_geocode(payload.receiverName, payload.receiverAddress)
+        return preview_geocode(
+            payload.receiverName, payload.receiverAddress,
+            drs_id=payload.drsId, consignment_id=payload.consignmentId,
+        )
     except Exception as e:
         logger.exception("geocode_preview failed")
         return {"status": "failed", "error": str(e)}
