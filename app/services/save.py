@@ -361,10 +361,13 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
         confirmed = (confirmed_locations or {}).get(consignment_id)
 
         if confirmed:
-            # Executive already accepted/corrected this point on the map:
-            # persist it as-is, no cache lookup and no Places call. Metadata
-            # (locality, area, pincode, place_id, ...) is intentionally absent
-            # and degrades to build_row's defaults.
+            # Executive already accepted/corrected this point on the map. No
+            # cache lookup and no Places call - but still reconcile against
+            # the DRS memo for an already-resolved same-place entry (possibly
+            # under a different spelling), so this consignment's saved point
+            # agrees with the rest of the group instead of drifting on its
+            # own. Metadata (locality, area, pincode, place_id, ...) is
+            # intentionally absent and degrades to build_row's defaults.
             geocode_result = {
                 "latitude": confirmed.latitude,
                 "longitude": confirmed.longitude,
@@ -375,16 +378,19 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                 "Using executive-confirmed location for consignment %s (corrected=%s)",
                 consignment_id, confirmed.corrected,
             )
-            # Share the confirmed pin with same-place consignments later in
-            # this DRS. A correction outranks even the verified cache.
+            # Reconcile with same-place consignments already resolved
+            # earlier in this DRS. A correction outranks even the verified
+            # cache; a plain acceptance defers to any entry at least as
+            # trustworthy, and geocode_result is replaced with that entry's
+            # pin so the saved row agrees with it.
             if memo_drs_id:
-                _safe(
-                    drs_memo.remember, memo_drs_id, match_info, geocode_result,
+                geocode_result, _memo_entry_id = _safe(
+                    drs_memo.reconcile, memo_drs_id, match_info, geocode_result,
                     drs_memo.SOURCE_EXEC_CORRECTED if confirmed.corrected
                     else drs_memo.SOURCE_EXEC_ACCEPTED,
                     lookup_address=receiver_address or None,
                     consignment_id=consignment_id,
-                )
+                ) or (geocode_result, None)
         else:
             geocode_result, error_reason, _error_code, cache_outcome = _geocode(
                 geocode_address_str,

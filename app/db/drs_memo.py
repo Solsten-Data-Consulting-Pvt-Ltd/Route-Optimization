@@ -101,14 +101,19 @@ def result_from_entry(entry: dict, address: str) -> dict:
 def remember(drs_id, info: dict, result: dict, source: str, *,
              lookup_address: Optional[str] = None,
              consignment_id: Optional[str] = None,
-             entries: Optional[dict] = None) -> Optional[str]:
+             entries: Optional[dict] = None,
+             _target_entry_id: Optional[str] = None) -> Optional[str]:
     """Store `result` as this consignment's memo entry. Returns the entry id.
 
     `entries` (already-loaded memo) avoids a second read; if omitted it is
     loaded. An entry is never downgraded (e.g. an API pin never replaces an
     executive correction) - in that case only variants/ids are appended.
+
+    `_target_entry_id` (internal, set by `reconcile`) writes into an
+    already-matched entry instead of this address's own hash - used to
+    upgrade a same-place entry found under a different spelling.
     """
-    entry_id = (info or {}).get("entry_id")
+    entry_id = _target_entry_id or (info or {}).get("entry_id")
     if not drs_id or not entry_id or not result:
         return None
     if result.get("latitude") is None or result.get("longitude") is None:
@@ -155,3 +160,55 @@ def link(drs_id, entry_id, *, lookup_address=None, consignment_id=None) -> None:
         "expires_at": datetime.now(timezone.utc) + timedelta(days=DRS_MEMO_TTL_DAYS),
         "entries": {entry_id: update},
     }, merge=True)
+
+
+def reconcile(drs_id, info: dict, result: dict, source: str, *,
+              lookup_address: Optional[str] = None,
+              consignment_id: Optional[str] = None,
+              entries: Optional[dict] = None) -> Tuple[dict, Optional[str]]:
+    """Like `remember`, but runs `find_match` first so a pin that was NOT
+    reached via `_geocode` (i.e. an executive-confirmed location, which
+    skips `_geocode` entirely) can still merge with a same-place entry that
+    exists under a different spelling.
+
+    `remember` alone only merges on an exact `entry_id` hash collision
+    (byte-identical normalized address text) - it never runs the
+    phone/door-number/fuzzy rules in `drs_match`. Any caller that has not
+    already run `find_match` immediately beforehand should use this instead.
+
+    Returns (authoritative_result, entry_id):
+      - if a same-place entry already exists and is at least as trustworthy
+        as `source`, that entry's own pin is returned (and `consignment_id`
+        is linked to it) - callers should persist THIS result, not their
+        own, so the saved row agrees with the rest of the group.
+      - otherwise `result` is persisted (upgrading the matched entry in
+        place if one was found, else stored as a new entry keyed on this
+        address's own hash) and returned unchanged.
+    """
+    entry_id = (info or {}).get("entry_id")
+    if not drs_id or not entry_id or not result:
+        return result, None
+    if result.get("latitude") is None or result.get("longitude") is None:
+        return result, None
+
+    if entries is None:
+        entries = load_entries(drs_id)
+
+    hit = find_match(entries, info)
+    if hit:
+        match_id, entry, _reason = hit
+        if _SOURCE_PRIORITY.get(entry.get("source"), 0) >= _SOURCE_PRIORITY.get(source, 0):
+            # Existing entry is at least as trustworthy - reuse its pin
+            # instead of drifting off on this consignment's own point.
+            link(drs_id, match_id, lookup_address=lookup_address, consignment_id=consignment_id)
+            return result_from_entry(entry, lookup_address or ""), match_id
+        # This source outranks the match - upgrade that SAME entry in
+        # place (not a new one keyed on this address's own hash).
+        remember(drs_id, info, result, source, lookup_address=lookup_address,
+                 consignment_id=consignment_id, entries=entries, _target_entry_id=match_id)
+        return result, match_id
+
+    # No existing entry for this place - fall back to hash-keyed remember.
+    remember(drs_id, info, result, source, lookup_address=lookup_address,
+             consignment_id=consignment_id, entries=entries)
+    return result, entry_id
