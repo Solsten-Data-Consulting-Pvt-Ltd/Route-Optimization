@@ -157,6 +157,10 @@ def merge_routing_rows(rows):
 
 
 def fetch_rows_by_consignment_ids(consignment_ids):
+    """Unscoped by drsNo — kept for callers that genuinely want every row a
+    consignmentId has ever had (e.g. one-off diagnostics). The save pipeline
+    itself must NOT use this: see fetch_rows_by_consignment_drs_pairs below
+    for why."""
     if not consignment_ids:
         return []
 
@@ -165,6 +169,94 @@ def fetch_rows_by_consignment_ids(consignment_ids):
         query_parameters=[bigquery.ArrayQueryParameter("ids", "STRING", consignment_ids)]
     )
     return list(get_bq_client().query(query, job_config=job_config).result())
+
+
+def _pair_struct_param(consignment_id, drs_no):
+    return bigquery.StructQueryParameter(
+        None,
+        bigquery.ScalarQueryParameter("consignmentId", "STRING", consignment_id),
+        bigquery.ScalarQueryParameter("drsNo", "STRING", drs_no),
+    )
+
+
+def _deduped_pairs(pairs):
+    return sorted({(cid, drs) for cid, drs in pairs if cid and drs})
+
+
+def fetch_rows_by_consignment_drs_pairs(pairs):
+    """Like fetch_rows_by_consignment_ids, but scoped to the exact
+    (consignmentId, drsNo) pairs just merged — not every row a consignmentId
+    has ever had across every DRS it has been assigned to.
+
+    A consignmentId can have more than one row in this table: the MERGE
+    above keys on (consignmentId, drsNo), so a reassignment or a
+    released-then-redelivered consignment landing on a new DRS inserts a
+    fresh row rather than updating the old one — the old DRS's row is left
+    behind. fetch_rows_by_consignment_ids pulled back ALL of a
+    consignmentId's rows regardless of drsNo, and since Firestore holds only
+    one document per consignmentId (_commit_in_batches keys on
+    row.consignmentId alone), whichever row an unordered SELECT * happened
+    to return last would silently win and get written — including a stale,
+    unrelated DRS's latitude/longitude/plannedLatitude. Scoping the
+    read-back to only the row(s) actually just written keeps every save
+    internally consistent regardless of how many other DRSs this
+    consignmentId has ever touched.
+    """
+    deduped = _deduped_pairs(pairs)
+    if not deduped:
+        return []
+
+    query = f"""
+        SELECT T.* FROM `{TABLE_REF}` T
+        WHERE EXISTS (
+            SELECT 1 FROM UNNEST(@pairs) AS p
+            WHERE p.consignmentId = T.consignmentId AND p.drsNo = T.drsNo
+        )
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter(
+                "pairs", "STRUCT", [_pair_struct_param(cid, drs) for cid, drs in deduped]
+            ),
+        ]
+    )
+    return list(get_bq_client().query(query, job_config=job_config).result())
+
+
+def deactivate_stale_routing_rows(pairs):
+    """Best-effort cleanup: when a consignment is saved under a DRS other
+    than one it already has a row for (reassignment / released-then-
+    redelivered), mark that OTHER row's is_active False so it stops
+    accumulating and stops being a trap for anything that reads this table
+    by consignmentId alone. is_active already exists on this table and is
+    already respected by fetch_active_rows_for_drs — nothing previously set
+    it False on reassignment, so old rows just piled up forever.
+
+    Only ever touches rows for a consignmentId in `pairs` whose drsNo
+    differs from the pair given for it — never the row that was just
+    written by this same save.
+    """
+    deduped = _deduped_pairs(pairs)
+    if not deduped:
+        return
+
+    query = f"""
+        UPDATE `{TABLE_REF}` AS T
+        SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP()
+        WHERE is_active IS TRUE
+          AND EXISTS (
+              SELECT 1 FROM UNNEST(@pairs) AS p
+              WHERE p.consignmentId = T.consignmentId AND p.drsNo != T.drsNo
+          )
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter(
+                "pairs", "STRUCT", [_pair_struct_param(cid, drs) for cid, drs in deduped]
+            ),
+        ]
+    )
+    get_bq_client().query(query, job_config=job_config).result()
 
 
 def fetch_active_rows_for_drs(drs_no):

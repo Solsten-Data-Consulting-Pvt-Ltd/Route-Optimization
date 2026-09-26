@@ -7,7 +7,11 @@ from datetime import datetime, timezone
 import pygeohash as pgh
 
 from app.config import GEOHASH_BUILDING_LEN, GEOHASH_LOCALITY_LEN, GOOGLE_MAPS_API_KEY
-from app.db.bigquery import fetch_rows_by_consignment_ids, merge_routing_rows
+from app.db.bigquery import (
+    deactivate_stale_routing_rows,
+    fetch_rows_by_consignment_drs_pairs,
+    merge_routing_rows,
+)
 from app.db.cache_metrics import write_drs_cache_metrics
 from app.db.firestore import get_consignments_by_id, upsert_consignments_routing
 from app.db import drs_memo
@@ -489,7 +493,21 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
 
     if rows_to_merge:
         merge_routing_rows(rows_to_merge)
-        bq_rows = fetch_rows_by_consignment_ids([r["consignmentId"] for r in rows_to_merge])
+        # (consignmentId, drsNo) pairs actually just merged — used to scope
+        # both the stale-row cleanup and the Firestore read-back to exactly
+        # this save, never every DRS this consignmentId has ever touched.
+        # See fetch_rows_by_consignment_drs_pairs' docstring for why an
+        # unscoped-by-drsNo read-back silently corrupted Firestore whenever
+        # a consignment had been reassigned/redelivered to more than one DRS.
+        saved_pairs = [(r["consignmentId"], r["drsNo"]) for r in rows_to_merge]
+        try:
+            deactivate_stale_routing_rows(saved_pairs)
+        except Exception:
+            # Best-effort cleanup only — must never fail a save that has
+            # already succeeded. Worst case, a stale row is left active and
+            # gets cleaned up on this consignment's next save instead.
+            logger.exception("Failed to deactivate stale routing rows")
+        bq_rows = fetch_rows_by_consignment_drs_pairs(saved_pairs)
         upsert_consignments_routing(bq_rows)
 
     try:

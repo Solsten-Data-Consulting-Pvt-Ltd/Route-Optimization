@@ -18,6 +18,7 @@ os.environ.setdefault("FIRESTORE_PROJECT", "test-project")
 
 from pydantic import ValidationError
 
+from app.db import bigquery as bq_mod
 from app.db.bigquery import MERGE_SQL, _row_to_struct_param
 from app.db.firestore import _base_routing_doc, _save_routing_doc
 from app.schemas import ConfirmedLocation, SaveConsignmentsRequest
@@ -86,7 +87,8 @@ class SaveBypassTests(unittest.TestCase):
              patch.object(save_mod, "_geocode",
                           return_value=(PLACES_RESULT, None, None, "miss")) as g, \
              patch.object(save_mod, "merge_routing_rows") as merge, \
-             patch.object(save_mod, "fetch_rows_by_consignment_ids", return_value=[]), \
+             patch.object(save_mod, "fetch_rows_by_consignment_drs_pairs", return_value=[]), \
+             patch.object(save_mod, "deactivate_stale_routing_rows"), \
              patch.object(save_mod, "upsert_consignments_routing"), \
              patch.object(save_mod, "write_drs_cache_metrics"), \
              patch.object(save_mod.drs_memo, "remember"):
@@ -244,6 +246,80 @@ class PersistenceTests(unittest.TestCase):
                 "more recent than the BigQuery row it read, so writing this "
                 "key (even via a merge write) can silently revert one.",
             )
+
+
+class ScopedFetchAndCleanupTests(unittest.TestCase):
+    """Regression coverage for the cross-DRS row-collision bug: a
+    consignmentId reassigned across DRSs (release-and-redeliver, or repeated
+    test reassignment) accumulates one BigQuery row per DRS it has ever been
+    on, because the MERGE keys on (consignmentId, drsNo). The old
+    fetch_rows_by_consignment_ids read back EVERY row for a consignmentId
+    regardless of drsNo, and since Firestore holds only one document per
+    consignmentId, whichever row an unordered SELECT * happened to return
+    last would silently overwrite it — including a stale, unrelated DRS's
+    latitude/longitude/plannedLatitude. These tests pin down the fix:
+    fetch_rows_by_consignment_drs_pairs scopes to exactly the pairs given,
+    deactivate_stale_routing_rows only ever targets a DIFFERENT drsNo for
+    the same consignmentId, and the save pipeline passes only the
+    current save's own pairs to both."""
+
+    def test_fetch_scopes_query_to_given_pairs_and_dedupes(self):
+        with patch.object(bq_mod, "get_bq_client") as get_client:
+            fake_client = get_client.return_value
+            fake_client.query.return_value.result.return_value = ["ROW"]
+            result = bq_mod.fetch_rows_by_consignment_drs_pairs(
+                [("C1", "DRS_B"), ("C1", "DRS_B")]  # duplicate on purpose
+            )
+
+        self.assertEqual(result, ["ROW"])
+        query_text = fake_client.query.call_args.args[0]
+        self.assertIn("EXISTS", query_text)
+        self.assertIn("p.consignmentId = T.consignmentId AND p.drsNo = T.drsNo", query_text)
+        job_config = fake_client.query.call_args.kwargs["job_config"]
+        pairs_param = job_config.query_parameters[0]
+        self.assertEqual(pairs_param.array_type, "STRUCT")
+        self.assertEqual(len(pairs_param.values), 1, "duplicate pair must be deduped")
+
+    def test_fetch_empty_pairs_returns_empty_without_querying_bigquery(self):
+        with patch.object(bq_mod, "get_bq_client") as get_client:
+            result = bq_mod.fetch_rows_by_consignment_drs_pairs([])
+        self.assertEqual(result, [])
+        get_client.assert_not_called()
+
+    def test_deactivate_targets_only_a_different_drs_for_the_same_consignment(self):
+        with patch.object(bq_mod, "get_bq_client") as get_client:
+            fake_client = get_client.return_value
+            bq_mod.deactivate_stale_routing_rows([("C1", "DRS_B")])
+
+        query_text = fake_client.query.call_args.args[0]
+        self.assertIn("SET is_active = FALSE", query_text)
+        self.assertIn("p.consignmentId = T.consignmentId AND p.drsNo != T.drsNo", query_text)
+        fake_client.query.return_value.result.assert_called_once()
+
+    def test_deactivate_empty_pairs_is_a_noop(self):
+        with patch.object(bq_mod, "get_bq_client") as get_client:
+            bq_mod.deactivate_stale_routing_rows([])
+        get_client.assert_not_called()
+
+    def test_save_pipeline_scopes_readback_and_cleanup_to_the_drs_just_saved(self):
+        """End-to-end: even if BigQuery holds rows for this consignmentId on
+        several DRSs, the save pipeline must only ever pass the DRS it just
+        wrote to (from the consignment doc's own drsNo, "D1" per _Doc above)
+        to both the read-back and the cleanup — never the whole history."""
+        conf = {"C1": ConfirmedLocation(latitude=13.0, longitude=77.7,
+                                        corrected=True, overriddenBy="EXEC1")}
+        with patch.object(save_mod, "get_consignments_by_id",
+                          return_value=([_Doc("C1")], [])), \
+             patch.object(save_mod, "merge_routing_rows"), \
+             patch.object(save_mod, "fetch_rows_by_consignment_drs_pairs",
+                          return_value=[]) as fetch, \
+             patch.object(save_mod, "deactivate_stale_routing_rows") as deactivate, \
+             patch.object(save_mod, "upsert_consignments_routing"), \
+             patch.object(save_mod, "write_drs_cache_metrics"):
+            save_mod.save_consignments_pipeline(["C1"], confirmed_locations=conf)
+
+        fetch.assert_called_once_with([("C1", "D1")])
+        deactivate.assert_called_once_with([("C1", "D1")])
 
 
 class RouterTests(unittest.TestCase):

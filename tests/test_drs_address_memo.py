@@ -327,7 +327,8 @@ class PipelineScenarioTests(unittest.TestCase):
              patch.object(save_mod, "places_search_address", side_effect=fake_places) as places, \
              patch.object(save_mod, "save_to_cache"), \
              patch.object(save_mod, "merge_routing_rows") as merge, \
-             patch.object(save_mod, "fetch_rows_by_consignment_ids", return_value=[]), \
+             patch.object(save_mod, "fetch_rows_by_consignment_drs_pairs", return_value=[]), \
+             patch.object(save_mod, "deactivate_stale_routing_rows"), \
              patch.object(save_mod, "upsert_consignments_routing"), \
              patch.object(save_mod, "write_drs_cache_metrics"):
             result = save_mod.save_consignments_pipeline([d.id for d in docs])
@@ -354,7 +355,8 @@ class PipelineScenarioTests(unittest.TestCase):
              patch.object(save_mod, "places_search_address", side_effect=fake_places) as places, \
              patch.object(save_mod, "save_to_cache"), \
              patch.object(save_mod, "merge_routing_rows") as merge, \
-             patch.object(save_mod, "fetch_rows_by_consignment_ids", return_value=[]), \
+             patch.object(save_mod, "fetch_rows_by_consignment_drs_pairs", return_value=[]), \
+             patch.object(save_mod, "deactivate_stale_routing_rows"), \
              patch.object(save_mod, "upsert_consignments_routing"), \
              patch.object(save_mod, "write_drs_cache_metrics"):
             save_mod.save_consignments_pipeline(["L1", "L2"], confirmed_locations=conf)
