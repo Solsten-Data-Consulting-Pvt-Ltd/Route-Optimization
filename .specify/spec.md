@@ -28,9 +28,10 @@
 | **`VECTOR_SEARCH` / `ML.DISTANCE`** | BigQuery SQL functions for nearest-neighbor / cosine-distance search over embedding columns. |
 | **Haversine distance** | Great-circle distance formula. Already implemented: `app/services/tsp.py:17`, `haversine_distance()`. Reused, not reimplemented, by every new distance check in this spec. |
 | **Feature flag** | A config value that turns a piece of behavior on/off (or scopes it to a subset of traffic) without a code deploy. Used here (§5.6) so every new requirement in this spec can ship disabled and be enabled deliberately. |
-| **Canary (rollout)** | Enabling new behavior for a small, deliberately chosen subset first (here: specific DRSs/depots, or a percentage via a deterministic hash of `drsNo`) before enabling it for everyone, to catch problems while blast radius is still small. |
+| **Canary** | Here: enabling a flag in prod, watching what it produces (HILT volume, errors, audit records) for a practical window (a day, a shift), and flipping it back off immediately if something's wrong — no traffic routing, no redeploy either direction. |
 | **Dark launch / default-OFF** | Merging new code to production while its feature flag is off, so it exists in the deployed service but has no live effect until deliberately enabled. |
 | **Config version** | An incrementing identifier on a config/flag document, stamped onto any record that resulted from a flagged decision, so "what threshold was active when this happened" is answerable later without guessing from current config. |
+| **V1/V2 wrapper** | The way a flag actually changes behavior in code: the existing function gains a flag check and a second branch. Flag off → the exact code that runs today (V1). Flag on → the new logic (V2). Both live in the codebase at once; no new endpoint or URL is involved, and reverting is flipping the flag, not deploying. |
 
 ---
 
@@ -234,13 +235,22 @@ This repo is a live prod API (Cloud Run, two endpoints in active use today). Eve
 | Static | `app/config.py`, env vars (existing pattern, `os.environ[...]`) | Project IDs, table names, API keys — things that don't change at runtime | Yes |
 | Dynamic | New Firestore collection, e.g. `app_config` | Feature on/off flags, the outlier-tier thresholds (§5.2), the fuzzy/similarity cutoffs, rollout scope | **No** |
 
-The dynamic layer is read through a cached-snapshot accessor that mirrors `geocache.py`'s existing `_verified_entries()` pattern (`app/db/geocache.py:156`, TTL-based process-local cache) — same idiom, new collection. This is why Firestore over env vars for anything behavioral: an env var change needs a new Cloud Run revision; a Firestore doc write is live within one TTL window, which is what canary actually needs.
+The dynamic layer is read through a cached-snapshot accessor that mirrors `geocache.py`'s existing `_verified_entries()` pattern (`app/db/geocache.py:156`, TTL-based process-local cache) — same idiom, new collection. This is why Firestore over env vars for anything behavioral: an env var change needs a new Cloud Run revision; a Firestore doc write is live within one TTL window, which is what makes a same-day enable/revert possible.
 
-**Every new flag defaults OFF.** New code merges to `main`/prod disabled — "unimplemented" from the caller's perspective — and is enabled deliberately per §5.6's rollout mechanism below, never by the act of merging.
+**None of this exists in the repo today.** `app/config.py` is 26 lines of static `os.environ[...]` reads only — no Firestore-backed flags, no feature-flag library, nothing dynamic anywhere in the codebase. This is new infrastructure, built once, then reused by every requirement in §5.1–§5.5.
 
-**Rollout/canary scope is a business dimension, not raw traffic %.** Cloud Run's native revision traffic-splitting exists and is a fine complementary tool, but blast radius here is about *which DRSs/depots* run the new logic, not which raw HTTP requests do. The flag document carries a `rollout` field: either an explicit allowlist (`drsNo`/depot values) for deliberate early testing, or a `rollout_percent` applied via a deterministic hash of `drsNo` — so a given DRS gets consistent behavior for its whole run, and rollout state is describable in plain terms ("depot X is on the new outlier check") rather than statistically.
+**Implementation mechanism — internal V1/V2 wrapper, not a URL version.** Each piece of new behavior is added as a second code path behind a flag check, inside the existing function, not as a new endpoint:
 
-**The outlier trap's own tiers (§5.2) are a canary mechanism, not just a UX choice.** Suggestion (2km) and Medium (5km) never block anything — only the 10km Blocked tier can refuse a DRS. A sensible rollout is: ship with only Suggestion active (nothing blocks), watch HILT queue volume, then enable Medium, then Blocked — using the same flag-driven per-tier enablement, not a separate mechanism.
+- Flag **off** → the exact code that runs today, unmodified ("V1").
+- Flag **on** → the new logic ("V2").
+
+E.g. `_geocode()` in `save.py:76` gains a flag check before it does anything new; if `flags.get("geocoding_ambiguity_v2")` is off, it behaves exactly as it does today. `compute_groups_and_sequence()` in `sorting.py:19` gets the same treatment for the outlier check. The router, the URL, and everything a caller sees stay identical either way — V1 and V2 both live in the code at the same time, and switching between them is a Firestore write, not a deploy.
+
+**Every new flag defaults OFF.** New code merges to `main`/prod disabled — "unimplemented" from the caller's perspective.
+
+**Canary here means: enable, watch, revert fast — not traffic routing.** Turn a flag on, let it run in prod (a day, a shift, whatever's practical), watch the HILT queue / error rate / audit records it produces, and if something's wrong, flip it back off — live, no redeploy, no code change, back to V1 immediately. That's the whole mechanism. (An allowlist or percentage-based partial rollout is possible later as a refinement, but it's not required for this to work — the flag's on/off switch *is* the safety net.)
+
+**The 2km/5km/10km outlier tiers (§5.2) are not canary** — that was a miscategorization in an earlier draft of this section. They're config-based HILT severity gates: business logic about how bad an outlier has to be before it escalates from a suggestion to a block, unrelated to the rollout mechanism above. They're covered by the same flag-off-means-V1-behavior rule, nothing more.
 
 **Backfill / "run for past too":** the outlier check and the ambiguity classification (§5.1, §5.2) are pure functions over stored lat/lon and API responses — they don't depend on request-time state. That means the same functions run identically from a standalone backfill script (reading existing `consignments_routing` rows, applying a chosen config snapshot) as from the live pipeline. A backfill run should record which config values it used (see versioning below) so results are reproducible and auditable, not silent.
 
@@ -265,7 +275,7 @@ Per-requirement blast radius is stated inline in §5; this table is the cross-cu
 | 5.5 | BQML / vector-search evaluation | BQ embeddings dataset/table, BQML remote model, Vertex AI connection, offline eval script | none (evaluation-only; no `app/` code calls it yet) | entire live request path | **Low** for this repo today (nothing production-facing changes); **cost/infra risk** if later wired in without the geohash/pincode bound (see the hard constraint in §5.5) |
 | 5.6 | Configuration & feature flags | Firestore `app_config` collection, cached-accessor module, `docs/CONFIG.md` | none directly (5.1–5.4's new code reads flags, but this row is the flag system itself) | `config.py`'s existing static values, all existing request/response shapes | **Low** — additive infrastructure; this is the mechanism that *reduces* 5.1/5.2's risk, since every behavior it gates defaults OFF |
 
-**Overall:** every item is additive/short-circuiting rather than a rewrite of existing logic — `geocache.py` and `tsp.py`, the two most load-bearing existing modules, are read by every new tier but never modified. The two items carrying real risk are 5.1 (touches the live request path directly) and 5.2 (a threshold that's wrong in either direction has an operational cost); 5.6 is what keeps that risk contained in prod — both ship default-OFF behind flags and roll out per-depot/DRS rather than all-at-once (see §5.6).
+**Overall:** every item is additive/short-circuiting rather than a rewrite of existing logic — `geocache.py` and `tsp.py`, the two most load-bearing existing modules, are read by every new tier but never modified. The two items carrying real risk are 5.1 (touches the live request path directly) and 5.2 (a threshold that's wrong in either direction has an operational cost); 5.6 is what keeps that risk contained in prod — both ship as a second (V2) code path behind a flag that defaults off, with the existing behavior (V1) always available as an instant, no-redeploy revert (see §5.6).
 
 ---
 
