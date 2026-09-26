@@ -37,6 +37,5 @@ jobs:
           --source .
           --no-allow-unauthenticated
           --timeout 300
-          --min-instances 1
           --update-env-vars BQ_PROJECT="$GCP_PROJECT_ID",FIRESTORE_PROJECT="$GCP_PROJECT_ID",BQ_DATASET=Hermes_Exports,BQ_TABLE=consignments_routing,BQ_STRUCTURED_TABLE=consignments_structured
           --set-secrets GOOGLE_MAPS_API_KEY=google-maps-api-key:latest
