@@ -258,7 +258,53 @@ E.g. `_geocode()` in `save.py:76` gains a flag check before it does anything new
 
 **Deliverable:** a `docs/CONFIG.md` (or `.specify/config.md`) documenting every flag/threshold — name, default, effect, which requirement it gates, and rollout state — kept current as flags are added; this is the "config with doc explaining config" this section exists to satisfy.
 
+**Proposed `app_config` Firestore schema** — one document per flag, collection `app_config`, doc id = flag name:
+
+```jsonc
+// app_config/geocoding_ambiguity_v2
+{
+  "enabled": false,
+  "version": 1,
+  "gates": ["5.1"],
+  "description": "Bounds/multi-candidate classification in geocoding.py. Off = today's places[0]-always behavior.",
+  "updated_at": <timestamp>,
+  "updated_by": "pradeep@solsten.in"
+}
+
+// app_config/outlier_trap_v2
+{
+  "enabled": false,
+  "version": 1,
+  "gates": ["5.2"],
+  "thresholds_km": { "suggest": 2, "medium": 5, "block": 10 },
+  "description": "Pre-DRS solitary-outlier check in sorting.py.",
+  "updated_at": <timestamp>,
+  "updated_by": "pradeep@solsten.in"
+}
+
+// app_config/master_waypoint_v2       -> gates 5.3
+// app_config/eod_ingestion_v2         -> gates 5.4 (whether the new endpoint is live)
+// app_config/bqml_embeddings_eval     -> gates 5.5 (evaluation script only, never the live path)
+```
+
+`enabled` is the on/off switch. `version` increments on every write (so a HILT/outlier/promotion record can stamp which version produced it, per the versioning rule above). `thresholds_km` is the example of a flag carrying more than a boolean — the same doc pattern extends to any future numeric/config value a flag needs to gate. One doc per flag (rather than one giant config doc) means flipping `outlier_trap_v2.enabled` back to `false` at 2am can't accidentally touch `geocoding_ambiguity_v2` in the same write.
+
+The cached-accessor's TTL should be shorter than `geocache.py`'s 300s (`GEOCODE_CACHE_SNAPSHOT_TTL_SECONDS`) — a new `FEATURE_FLAG_SNAPSHOT_TTL_SECONDS`, proposed default 30-60s, since "revert quickly" is the entire point of this mechanism and a 5-minute-stale flag undermines it.
+
 **Blast radius:** new Firestore `app_config` collection, new cached-accessor module (e.g. `app/config_dynamic.py` or extending `app/db/`), a config-versioning field threaded through every new write in §5.1–§5.4, and a new doc file. No change to existing static `config.py` values or any existing request/response shape.
+
+### 5.7 Incremental migration path to versioned APIs
+
+Today, and for everything in §5.1–§5.6: **no URL version is needed** — every change is additive (new optional fields, new status values, a new endpoint), handled entirely by the V1/V2 internal wrapper in §5.6. This section exists for the future, in case a genuinely *breaking* change shows up later (e.g. a request/response shape that can't just grow a new field). It is not triggered by anything currently in this spec.
+
+| Phase | Trigger | What happens |
+|---|---|---|
+| **0 — now** | Every requirement in this spec | Internal V1/V2 flag wrapper inside the existing function, no URL change (§5.6). This is sufficient for everything specified today. |
+| **1 — a real breaking change appears** | A future change that can't be additive (e.g. a field must change type or be removed, not just added) | Only *that* endpoint gets a real versioned path, e.g. `POST /v2/run-sorting`, added alongside the existing `POST /run-sorting` (now implicitly "v1"). Both are live and fully functional at once — nothing is removed yet. |
+| **2 — caller migration** | Phase 1 shipped | Each known caller (mobile app, dispatcher tooling, any scheduler/cron) switches to the versioned path one at a time, on their own schedule. Track progress the same way as other flags — an `app_config` doc listing which callers have confirmed migration — rather than guessing from traffic. |
+| **3 — deprecate the old path** | All known callers confirmed on the new version | Only now does the unversioned/v1 path get formally deprecated (e.g. a deprecation warning header, a removal date announced), and only later actually removed. This is the one phase that deletes code, and it happens deliberately, long after Phase 1, never reflexively. |
+
+This mirrors the same philosophy as §5.6: never break what's live, add the new thing alongside the old thing, and only remove the old thing once you can prove nothing depends on it anymore.
 
 ---
 
@@ -274,6 +320,7 @@ Per-requirement blast radius is stated inline in §5; this table is the cross-cu
 | 5.4 | EOD ingestion contract | `app/routers/eod_feedback.py`, `app/services/eod_feedback.py`, `EodDeliveryFeedbackRequest` schema, BQ `delivery_audit` table | `app/routers/__init__.py` (register new router) | `save.py`, `sorting.py`, `tsp.py` | **Low** (this repo's side) / **Unknown** (the external mobile app's side — outside this repo's control, see §7 open item 3) |
 | 5.5 | BQML / vector-search evaluation | BQ embeddings dataset/table, BQML remote model, Vertex AI connection, offline eval script | none (evaluation-only; no `app/` code calls it yet) | entire live request path | **Low** for this repo today (nothing production-facing changes); **cost/infra risk** if later wired in without the geohash/pincode bound (see the hard constraint in §5.5) |
 | 5.6 | Configuration & feature flags | Firestore `app_config` collection, cached-accessor module, `docs/CONFIG.md` | none directly (5.1–5.4's new code reads flags, but this row is the flag system itself) | `config.py`'s existing static values, all existing request/response shapes | **Low** — additive infrastructure; this is the mechanism that *reduces* 5.1/5.2's risk, since every behavior it gates defaults OFF |
+| 5.7 | Versioned-API migration path | Nothing yet — this phase is not triggered by anything in this spec | none | every existing endpoint, `main.py`, all current callers | **None today** — a documented future process, not a current change. Only becomes real work if/when a genuinely breaking change is needed. |
 
 **Overall:** every item is additive/short-circuiting rather than a rewrite of existing logic — `geocache.py` and `tsp.py`, the two most load-bearing existing modules, are read by every new tier but never modified. The two items carrying real risk are 5.1 (touches the live request path directly) and 5.2 (a threshold that's wrong in either direction has an operational cost); 5.6 is what keeps that risk contained in prod — both ship as a second (V2) code path behind a flag that defaults off, with the existing behavior (V1) always available as an instant, no-redeploy revert (see §5.6).
 
@@ -291,6 +338,7 @@ Per-requirement blast radius is stated inline in §5; this table is the cross-cu
 | BigQuery (operational store) | `app/db/bigquery.py` | Extended with `delivery_audit` (§5.4) and the embeddings table (§5.5) |
 | Firestore | `app/db/firestore.py` | Extended with `master_waypoints` (§5.3) and a HILT queue collection |
 | RapidFuzz | `app/db/geocache.py` | Reused for master-waypoint alias matching |
+| API reference docs | `README.md:117-121,126,155,390-512` + FastAPI auto-docs (`/docs`, `/redoc` — live, not disabled in `main.py:10`) | Existing developer-facing doc pattern (endpoint table + request/response examples + curl/Postman). New endpoints (`/eod-delivery-feedback`, §5.4) should follow the same pattern; Pydantic models should gain field descriptions since `/docs` today only auto-generates from bare field names |
 
 ---
 
