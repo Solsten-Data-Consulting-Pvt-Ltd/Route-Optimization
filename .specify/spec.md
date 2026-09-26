@@ -27,6 +27,10 @@
 | **`text-embedding-005`** | A Google-hosted text embedding model, called here via a BQML remote model. |
 | **`VECTOR_SEARCH` / `ML.DISTANCE`** | BigQuery SQL functions for nearest-neighbor / cosine-distance search over embedding columns. |
 | **Haversine distance** | Great-circle distance formula. Already implemented: `app/services/tsp.py:17`, `haversine_distance()`. Reused, not reimplemented, by every new distance check in this spec. |
+| **Feature flag** | A config value that turns a piece of behavior on/off (or scopes it to a subset of traffic) without a code deploy. Used here (§5.6) so every new requirement in this spec can ship disabled and be enabled deliberately. |
+| **Canary (rollout)** | Enabling new behavior for a small, deliberately chosen subset first (here: specific DRSs/depots, or a percentage via a deterministic hash of `drsNo`) before enabling it for everyone, to catch problems while blast radius is still small. |
+| **Dark launch / default-OFF** | Merging new code to production while its feature flag is off, so it exists in the deployed service but has no live effect until deliberately enabled. |
+| **Config version** | An incrementing identifier on a config/flag document, stamped onto any record that resulted from a flagged decision, so "what threshold was active when this happened" is answerable later without guessing from current config. |
 
 ---
 
@@ -92,9 +96,17 @@ Verified against the current code, not against the original (Gemini-authored) pr
 
 ### 5.2 Solitary-outlier trap
 
-Before `compute_groups_and_sequence` (`app/services/sorting.py:19`) commits a DRS, compute each pending stop's distance to its nearest neighbor (or cluster centroid) using the existing `haversine_distance`. A stop beyond a configurable threshold (default proposal: 10km, matching the number given) is pulled out, marked for HILT, and the DRS write is blocked until it's resolved or explicitly overridden by a dispatcher.
+Before `compute_groups_and_sequence` (`app/services/sorting.py:19`) commits a DRS, compute each pending stop's distance to its nearest neighbor (or cluster centroid) using the existing `haversine_distance`. This is **tiered, not a single cutoff** — severity scales with distance, and all three numbers are config (§5.6), not hardcoded:
 
-**Blast radius:** new pre-check function, likely in `app/services/sorting.py` ahead of `solve_route_order`; reuses `tsp.py:17` haversine, adds no new distance math. `write_group_assignments` (`bigquery.py:199`) should not be called while an unresolved outlier exists for that DRS.
+| Tier | Default threshold | Effect |
+|---|---|---|
+| Suggestion | ≥ 2km | Stop is flagged to HILT as a non-blocking suggestion. DRS creation proceeds normally. |
+| Medium intervention | ≥ 5km | Stop is flagged to HILT as requiring review. DRS creation still proceeds (does **not** block), but the flag is elevated — intended to surface to a dispatcher, not just log. |
+| Blocked | ≥ 10km | DRS creation is refused for that stop until it's resolved or explicitly overridden by a dispatcher. |
+
+A stop only ever falls into the highest tier its distance qualifies for (10km ⇒ blocked, not also "medium" and "suggestion"). The three thresholds are independent config values, not derived from each other, so they can be tuned without a code change (§5.6).
+
+**Blast radius:** new pre-check function, likely in `app/services/sorting.py` ahead of `solve_route_order`; reuses `tsp.py:17` haversine, adds no new distance math. `write_group_assignments` (`bigquery.py:199`) is skipped only for stops in the Blocked tier, not Suggestion/Medium.
 
 ### 5.3 Master-waypoint tier
 
@@ -211,6 +223,33 @@ Processing (new function, e.g. `app/services/eod_feedback.py`, called from a new
 
 **Blast radius:** new BQ dataset/table for embeddings, a BQML remote model resource, a Vertex AI connection (GCP infra, provisioned outside application code), and an offline evaluation script outside `app/`. No production code path calls `ML.GENERATE_EMBEDDING` in this phase.
 
+### 5.6 Configuration & feature flags
+
+This repo is a live prod API (Cloud Run, two endpoints in active use today). Every requirement in §5.1–§5.5 is new behavior being added to that live request path, so this section is itself a requirement, not tooling on the side: **nothing above ships without a flag.**
+
+**Two-layer config, matching the pattern the repo already has:**
+
+| Layer | Where it lives | What goes here | Change requires a redeploy? |
+|---|---|---|---|
+| Static | `app/config.py`, env vars (existing pattern, `os.environ[...]`) | Project IDs, table names, API keys — things that don't change at runtime | Yes |
+| Dynamic | New Firestore collection, e.g. `app_config` | Feature on/off flags, the outlier-tier thresholds (§5.2), the fuzzy/similarity cutoffs, rollout scope | **No** |
+
+The dynamic layer is read through a cached-snapshot accessor that mirrors `geocache.py`'s existing `_verified_entries()` pattern (`app/db/geocache.py:156`, TTL-based process-local cache) — same idiom, new collection. This is why Firestore over env vars for anything behavioral: an env var change needs a new Cloud Run revision; a Firestore doc write is live within one TTL window, which is what canary actually needs.
+
+**Every new flag defaults OFF.** New code merges to `main`/prod disabled — "unimplemented" from the caller's perspective — and is enabled deliberately per §5.6's rollout mechanism below, never by the act of merging.
+
+**Rollout/canary scope is a business dimension, not raw traffic %.** Cloud Run's native revision traffic-splitting exists and is a fine complementary tool, but blast radius here is about *which DRSs/depots* run the new logic, not which raw HTTP requests do. The flag document carries a `rollout` field: either an explicit allowlist (`drsNo`/depot values) for deliberate early testing, or a `rollout_percent` applied via a deterministic hash of `drsNo` — so a given DRS gets consistent behavior for its whole run, and rollout state is describable in plain terms ("depot X is on the new outlier check") rather than statistically.
+
+**The outlier trap's own tiers (§5.2) are a canary mechanism, not just a UX choice.** Suggestion (2km) and Medium (5km) never block anything — only the 10km Blocked tier can refuse a DRS. A sensible rollout is: ship with only Suggestion active (nothing blocks), watch HILT queue volume, then enable Medium, then Blocked — using the same flag-driven per-tier enablement, not a separate mechanism.
+
+**Backfill / "run for past too":** the outlier check and the ambiguity classification (§5.1, §5.2) are pure functions over stored lat/lon and API responses — they don't depend on request-time state. That means the same functions run identically from a standalone backfill script (reading existing `consignments_routing` rows, applying a chosen config snapshot) as from the live pipeline. A backfill run should record which config values it used (see versioning below) so results are reproducible and auditable, not silent.
+
+**Config versioning (for audit/rollback, not a URL version):** each write to the `app_config` document carries an incrementing `version` field (the same optimistic-concurrency idea already available via Firestore). Every BQ/Firestore record this spec adds that resulted from a flagged decision (a HILT entry, an outlier flag, a master-waypoint promotion) stores the config `version` active at the time — so "why did this DRS get blocked" is answerable by looking up that version's threshold values, not guessing from current config. This is the versioning mechanism that matters here — a new REST API version (`/v2/...`) is **not** recommended, since every change in this spec is additive to existing request/response shapes; the one real contract obligation is that consumers of `geocode_status` treat unknown values (like `NEEDS_HILT`) defensively rather than erroring.
+
+**Deliverable:** a `docs/CONFIG.md` (or `.specify/config.md`) documenting every flag/threshold — name, default, effect, which requirement it gates, and rollout state — kept current as flags are added; this is the "config with doc explaining config" this section exists to satisfy.
+
+**Blast radius:** new Firestore `app_config` collection, new cached-accessor module (e.g. `app/config_dynamic.py` or extending `app/db/`), a config-versioning field threaded through every new write in §5.1–§5.4, and a new doc file. No change to existing static `config.py` values or any existing request/response shape.
+
 ---
 
 ## 6. Estimated blast radius (consolidated)
@@ -224,8 +263,9 @@ Per-requirement blast radius is stated inline in §5; this table is the cross-cu
 | 5.3 | Master-waypoint tier | `app/db/master_waypoint.py`, Firestore `master_waypoints` collection | `save.py` (`_geocode()` gains a first-tier lookup call) | `geocache.py`, `tsp.py` internals | **Low** — purely additive short-circuit; a miss falls through to today's exact behavior unchanged |
 | 5.4 | EOD ingestion contract | `app/routers/eod_feedback.py`, `app/services/eod_feedback.py`, `EodDeliveryFeedbackRequest` schema, BQ `delivery_audit` table | `app/routers/__init__.py` (register new router) | `save.py`, `sorting.py`, `tsp.py` | **Low** (this repo's side) / **Unknown** (the external mobile app's side — outside this repo's control, see §7 open item 3) |
 | 5.5 | BQML / vector-search evaluation | BQ embeddings dataset/table, BQML remote model, Vertex AI connection, offline eval script | none (evaluation-only; no `app/` code calls it yet) | entire live request path | **Low** for this repo today (nothing production-facing changes); **cost/infra risk** if later wired in without the geohash/pincode bound (see the hard constraint in §5.5) |
+| 5.6 | Configuration & feature flags | Firestore `app_config` collection, cached-accessor module, `docs/CONFIG.md` | none directly (5.1–5.4's new code reads flags, but this row is the flag system itself) | `config.py`'s existing static values, all existing request/response shapes | **Low** — additive infrastructure; this is the mechanism that *reduces* 5.1/5.2's risk, since every behavior it gates defaults OFF |
 
-**Overall:** every item is additive/short-circuiting rather than a rewrite of existing logic — `geocache.py` and `tsp.py`, the two most load-bearing existing modules, are read by every new tier but never modified. The two items carrying real risk are 5.1 (touches the live request path directly) and 5.2 (a threshold that's wrong in either direction has an operational cost), so those two should get the most test coverage before rollout.
+**Overall:** every item is additive/short-circuiting rather than a rewrite of existing logic — `geocache.py` and `tsp.py`, the two most load-bearing existing modules, are read by every new tier but never modified. The two items carrying real risk are 5.1 (touches the live request path directly) and 5.2 (a threshold that's wrong in either direction has an operational cost); 5.6 is what keeps that risk contained in prod — both ship default-OFF behind flags and roll out per-depot/DRS rather than all-at-once (see §5.6).
 
 ---
 
