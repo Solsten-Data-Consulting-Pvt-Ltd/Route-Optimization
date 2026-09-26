@@ -1,4 +1,5 @@
 fastapi
+httpx2  # required by starlette.testclient.TestClient (used in tests/test_geocode_preview_and_bypass.py)
 uvicorn[standard]
 requests
 pygeohash

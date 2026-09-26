@@ -50,13 +50,20 @@ def _row_to_struct_param(row):
         bigquery.ScalarQueryParameter("country_code", "STRING", row["country_code"]),
         bigquery.ScalarQueryParameter("geocode_status", "STRING", row["geocode_status"]),
         bigquery.ScalarQueryParameter("geocode_error", "STRING", row["geocode_error"]),
+        bigquery.ScalarQueryParameter("locationOverridden", "BOOL", row["locationOverridden"]),
+        bigquery.ScalarQueryParameter("overriddenBy", "STRING", row["overriddenBy"]),
+        bigquery.ScalarQueryParameter("overriddenAt", "TIMESTAMP", row["overriddenAt"]),
+        bigquery.ScalarQueryParameter("planned_latitude", "FLOAT64", row["planned_latitude"]),
+        bigquery.ScalarQueryParameter("planned_longitude", "FLOAT64", row["planned_longitude"]),
     )
 
 
 # MATCHED (consignment already in BQ): updates address/geocode fields only.
 # sorting_id, geohash_group_id and the planned_*/actual_* sequence fields are
 # left untouched so an already-routed consignment doesn't get silently
-# un-grouped by a later re-save.
+# un-grouped by a later re-save. planned_latitude/planned_longitude (the
+# FIRST point this consignment ever resolved to) are excluded from the
+# UPDATE branch for the same reason — set once on insert, frozen after.
 # NOT MATCHED (new consignment): inserts a fresh row with a generated
 # sorting_id and geohash_group_id = 'UNASSIGNED', ready for run_sorting.
 MERGE_SQL = f"""
@@ -91,6 +98,9 @@ MERGE_SQL = f"""
         T.country_code = S.country_code,
         T.geocode_status = S.geocode_status,
         T.geocode_error = S.geocode_error,
+        T.locationOverridden = S.locationOverridden,
+        T.overriddenBy = S.overriddenBy,
+        T.overriddenAt = S.overriddenAt,
         T.updated_at = CURRENT_TIMESTAMP()
     WHEN NOT MATCHED THEN INSERT (
         sorting_id, drsNo, drsId, driverNumericId, consignmentId,
@@ -102,7 +112,10 @@ MERGE_SQL = f"""
         geocoding_source, exception_flag, is_commercial, is_active,
         formatted_address, place_id, location_type,
         street_number, route_name, district, state, country_code,
-        geocode_status, geocode_error, created_at, updated_at
+        geocode_status, geocode_error,
+        locationOverridden, overriddenBy, overriddenAt,
+        planned_latitude, planned_longitude,
+        created_at, updated_at
     ) VALUES (
         GENERATE_UUID(), S.drsNo, S.drsId, S.driverNumericId, S.consignmentId,
         S.receiverAddress, S.receiverName, S.geocode_address, S.starting_address,
@@ -112,7 +125,10 @@ MERGE_SQL = f"""
         '{GEOCODING_SOURCE}', S.exception_flag, S.is_commercial, TRUE,
         S.formatted_address, S.place_id, S.location_type,
         S.street_number, S.route_name, S.district, S.state, S.country_code,
-        S.geocode_status, S.geocode_error, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
+        S.geocode_status, S.geocode_error,
+        S.locationOverridden, S.overriddenBy, S.overriddenAt,
+        S.planned_latitude, S.planned_longitude,
+        CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
     )
 """
 
@@ -141,6 +157,10 @@ def merge_routing_rows(rows):
 
 
 def fetch_rows_by_consignment_ids(consignment_ids):
+    """Unscoped by drsNo — kept for callers that genuinely want every row a
+    consignmentId has ever had (e.g. one-off diagnostics). The save pipeline
+    itself must NOT use this: see fetch_rows_by_consignment_drs_pairs below
+    for why."""
     if not consignment_ids:
         return []
 
@@ -149,6 +169,94 @@ def fetch_rows_by_consignment_ids(consignment_ids):
         query_parameters=[bigquery.ArrayQueryParameter("ids", "STRING", consignment_ids)]
     )
     return list(get_bq_client().query(query, job_config=job_config).result())
+
+
+def _pair_struct_param(consignment_id, drs_no):
+    return bigquery.StructQueryParameter(
+        None,
+        bigquery.ScalarQueryParameter("consignmentId", "STRING", consignment_id),
+        bigquery.ScalarQueryParameter("drsNo", "STRING", drs_no),
+    )
+
+
+def _deduped_pairs(pairs):
+    return sorted({(cid, drs) for cid, drs in pairs if cid and drs})
+
+
+def fetch_rows_by_consignment_drs_pairs(pairs):
+    """Like fetch_rows_by_consignment_ids, but scoped to the exact
+    (consignmentId, drsNo) pairs just merged — not every row a consignmentId
+    has ever had across every DRS it has been assigned to.
+
+    A consignmentId can have more than one row in this table: the MERGE
+    above keys on (consignmentId, drsNo), so a reassignment or a
+    released-then-redelivered consignment landing on a new DRS inserts a
+    fresh row rather than updating the old one — the old DRS's row is left
+    behind. fetch_rows_by_consignment_ids pulled back ALL of a
+    consignmentId's rows regardless of drsNo, and since Firestore holds only
+    one document per consignmentId (_commit_in_batches keys on
+    row.consignmentId alone), whichever row an unordered SELECT * happened
+    to return last would silently win and get written — including a stale,
+    unrelated DRS's latitude/longitude/plannedLatitude. Scoping the
+    read-back to only the row(s) actually just written keeps every save
+    internally consistent regardless of how many other DRSs this
+    consignmentId has ever touched.
+    """
+    deduped = _deduped_pairs(pairs)
+    if not deduped:
+        return []
+
+    query = f"""
+        SELECT T.* FROM `{TABLE_REF}` T
+        WHERE EXISTS (
+            SELECT 1 FROM UNNEST(@pairs) AS p
+            WHERE p.consignmentId = T.consignmentId AND p.drsNo = T.drsNo
+        )
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter(
+                "pairs", "STRUCT", [_pair_struct_param(cid, drs) for cid, drs in deduped]
+            ),
+        ]
+    )
+    return list(get_bq_client().query(query, job_config=job_config).result())
+
+
+def deactivate_stale_routing_rows(pairs):
+    """Best-effort cleanup: when a consignment is saved under a DRS other
+    than one it already has a row for (reassignment / released-then-
+    redelivered), mark that OTHER row's is_active False so it stops
+    accumulating and stops being a trap for anything that reads this table
+    by consignmentId alone. is_active already exists on this table and is
+    already respected by fetch_active_rows_for_drs — nothing previously set
+    it False on reassignment, so old rows just piled up forever.
+
+    Only ever touches rows for a consignmentId in `pairs` whose drsNo
+    differs from the pair given for it — never the row that was just
+    written by this same save.
+    """
+    deduped = _deduped_pairs(pairs)
+    if not deduped:
+        return
+
+    query = f"""
+        UPDATE `{TABLE_REF}` AS T
+        SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP()
+        WHERE is_active IS TRUE
+          AND EXISTS (
+              SELECT 1 FROM UNNEST(@pairs) AS p
+              WHERE p.consignmentId = T.consignmentId AND p.drsNo != T.drsNo
+          )
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter(
+                "pairs", "STRUCT", [_pair_struct_param(cid, drs) for cid, drs in deduped]
+            ),
+        ]
+    )
+    get_bq_client().query(query, job_config=job_config).result()
 
 
 def fetch_active_rows_for_drs(drs_no):
@@ -168,7 +276,8 @@ def fetch_active_rows_for_drs(drs_no):
             C.geohash_locality_loc,
             C.geohash_building_loc,
             C.geohash_exact_loc,
-            C.planned_sequence_order
+            C.planned_sequence_order,
+            C.actual_sequence_order
         FROM `{TABLE_REF}` AS C
         JOIN `{STRUCTURED_TABLE_REF}` AS S
             ON C.drsNo = S.drsNo

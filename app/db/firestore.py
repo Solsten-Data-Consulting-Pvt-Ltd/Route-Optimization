@@ -74,7 +74,27 @@ def _iso(value):
     return value.isoformat() if value else None
 
 
-# Fields written by both pipelines.
+# Fields written by both pipelines — sequencing/grouping/generic metadata
+# only. Deliberately does NOT include latitude/longitude/locationOverridden/
+# overriddenBy/overriddenAt/plannedLatitude/plannedLongitude: those are
+# owned exclusively by _save_routing_doc below.
+#
+# This split exists because of a real bug: the sort pipeline
+# (upsert_routing_from_sorting, run on every "Optimize Route" click) used to
+# reuse this same dict builder, which included those location/override
+# fields sourced from whatever row fetch_assigned_rows_for_drs() happened to
+# read out of BigQuery. Since sort has no idea whether a manual pin
+# correction (from the save pipeline / executive edit / driver correction)
+# landed more recently than that BigQuery row, and the Firestore write is a
+# merge (so any key present in the payload wins), an Optimize Route run
+# could — and did — silently revert a correction someone had just made,
+# resetting locationOverridden/overriddenBy/overriddenAt back to
+# false/null/null in the process. See
+# tests/test_geocode_preview_and_bypass.py::PersistenceTests::
+# test_sort_doc_never_writes_location_or_override_fields for the regression
+# test, and docs/known-issues.md (3PL-Management-Suite repo) for how this
+# surfaced (a corrected consignment pin reverting on the admin/executive
+# maps after an Optimize Route re-run).
 def _base_routing_doc(row):
     return {
         "sorting_id": row.sorting_id,
@@ -88,8 +108,6 @@ def _base_routing_doc(row):
         "starting_address": row.starting_address,
         "starting_latitude": row.starting_latitude,
         "starting_longitude": row.starting_longitude,
-        "latitude": row.latitude,
-        "longitude": row.longitude,
         "locality": row.locality,
         "area": row.area,
         "geohash_locality_loc": row.geohash_locality_loc,
@@ -109,10 +127,27 @@ def _base_routing_doc(row):
     }
 
 
-# The save pipeline additionally publishes the geocode provenance fields.
+# The save pipeline additionally publishes the geocode provenance fields,
+# PLUS the location/override fields _base_routing_doc above deliberately
+# excludes. The save pipeline is the only writer that ever has a legitimate,
+# fresh answer for "where is this point and was it manually corrected" —
+# the sort pipeline (_base_routing_doc / upsert_routing_from_sorting) must
+# never touch these, see the comment above.
 def _save_routing_doc(row):
     doc = _base_routing_doc(row)
     doc.update({
+        "latitude": row.latitude,
+        "longitude": row.longitude,
+        # getattr: safe on rows fetched before the BigQuery columns exist.
+        "locationOverridden": bool(getattr(row, "locationOverridden", False) or False),
+        "overriddenBy": getattr(row, "overriddenBy", None),
+        "overriddenAt": _iso(getattr(row, "overriddenAt", None)),
+        # The frozen first-ever point for this consignment (see
+        # services/save.py::build_row's docstring) — getattr-guarded same as
+        # the override fields above, safe on rows fetched before these
+        # BigQuery columns existed.
+        "plannedLatitude": getattr(row, "planned_latitude", None),
+        "plannedLongitude": getattr(row, "planned_longitude", None),
         "formatted_address": getattr(row, "formatted_address", None),
         "place_id": getattr(row, "place_id", None),
         "location_type": getattr(row, "location_type", None),
@@ -153,6 +188,10 @@ def upsert_consignments_routing(rows):
 
 
 def upsert_routing_from_sorting(rows):
-    """Post-sorting sync: routing fields only, leaving the geocode provenance
-    fields written by the save pipeline untouched (the writes are merges)."""
+    """Post-sorting sync: sequencing/grouping fields only. Leaves the geocode
+    provenance fields AND the location/override fields (latitude, longitude,
+    locationOverridden, overriddenBy, overriddenAt, plannedLatitude,
+    plannedLongitude) written by the save pipeline untouched — the writes
+    are merges, and _base_routing_doc deliberately omits those keys so a
+    route re-optimize can never revert a manual pin correction."""
     return _commit_in_batches(rows, _base_routing_doc)

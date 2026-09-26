@@ -13,7 +13,7 @@ from app.services.tsp import solve_route_order
 
 logger = logging.getLogger(__name__)
 
-DELIVERED_STATUS_CODE = "DE"
+LOCKED_STATUSES = {"Delivered", "Not_Delivered"}  # driver already visited these — do not renumber
 
 
 def compute_groups_and_sequence(rows, drs_no, start_meta):
@@ -22,9 +22,10 @@ def compute_groups_and_sequence(rows, drs_no, start_meta):
       - planned_sequence_order: the row's position in the overall solved route
       - planned_inside_cluster_sequence: position within its own cluster
 
-    Delivered consignments (statusCode == "DE") are not re-optimized; they hold
-    on to the sequence slot they already occupy, and the pending stops are laid
-    out into whatever slots remain.
+    Consignments already visited by the driver (status "Delivered" or
+    "Not_Delivered") are not re-optimized; they hold on to the sequence slot
+    they already occupy, and the pending stops (In_Transit / Out_For_Delivery /
+    not yet attempted) are laid out into whatever slots remain.
 
     actual_* fields are initialized to match planned_* — they represent what
     actually happened on the ground and are expected to diverge over time
@@ -32,8 +33,8 @@ def compute_groups_and_sequence(rows, drs_no, start_meta):
     """
     total_slots = len(rows)
 
-    delivered_rows = [r for r in rows if getattr(r, "statusCode", None) == DELIVERED_STATUS_CODE]
-    pending_rows = [r for r in rows if getattr(r, "statusCode", None) != DELIVERED_STATUS_CODE]
+    delivered_rows = [r for r in rows if getattr(r, "status", None) in LOCKED_STATUSES]
+    pending_rows = [r for r in rows if getattr(r, "status", None) not in LOCKED_STATUSES]
 
     occupied_slots = set()
     for r in delivered_rows:
@@ -42,7 +43,7 @@ def compute_groups_and_sequence(rows, drs_no, start_meta):
             occupied_slots.add(slot)
         else:
             logger.warning(
-                "Delivered consignment %s has no existing sequence order; "
+                "Locked consignment %s has no existing sequence order; "
                 "it will not hold a fixed slot.", r.consignmentId
             )
 

@@ -187,6 +187,19 @@ def _exact_lookup(normalized: str):
         .limit(1)
         .stream()
     )
+    if docs:
+        return docs[0].id, (docs[0].to_dict() or {})
+
+    # A consolidated multi-spelling entry (see save_to_cache's drs_memo_group
+    # reuse below) stores every OTHER spelling it has absorbed here, since
+    # its own address_normalized only ever holds the first/canonical one.
+    docs = list(
+        _collection()
+        .where("address_normalized_variants", "array_contains", normalized)
+        .where("verified", "==", True)
+        .limit(1)
+        .stream()
+    )
     if not docs:
         return None
     return docs[0].id, (docs[0].to_dict() or {})
@@ -279,10 +292,20 @@ def get_cached_geocode(
     return result
 
 
+def _docs_by_group(drs_memo_group: str):
+    """Every geocode_cache doc already tagged with this drs_memo_group -
+    normally 0 (first spelling of a new place) or 1 (every later spelling
+    of a place the DRS memo already resolved earlier today reuses that same
+    doc instead of writing its own)."""
+    return list(_collection().where("drs_memo_group", "==", drs_memo_group).stream())
+
+
 def save_to_cache(
     address: str,
     geocode_result: dict,
     lookup_address: Optional[str] = None,
+    source: str = "api",
+    drs_memo_group: Optional[str] = None,
 ) -> None:
     """Persist a geocode result to the cache.
 
@@ -294,6 +317,11 @@ def save_to_cache(
     `geocode_address_raw` for traceability.
 
     If `lookup_address` is omitted the behaviour is identical to before.
+
+    `source` is "api" for a fresh Places result or "drs_memo" when the pin was
+    reused from another consignment in the same DRS. `drs_memo_group` links
+    all address variants that share one DRS-memo pin, so end-of-day
+    verification can verify them together (see `verify_cache_group`).
     """
     key_str = lookup_address if lookup_address else address
     normalized = normalize_address(key_str)
@@ -307,9 +335,42 @@ def save_to_cache(
         "address_raw":         address,     # full geocode string (name + address)
         "geocode_address_raw": address,     # alias kept for clarity
         "address_normalized":  normalized,  # Fix 1: keyed on location only
-        "source": "api",
+        "source": source,
         "updated_at": firestore.SERVER_TIMESTAMP,
     })
+    if drs_memo_group:
+        payload["drs_memo_group"] = drs_memo_group
+
+        # Reuse a sibling entry the DRS memo already tagged with this same
+        # group (see drs_memo.py & address_match.py::drs_match - it can
+        # match two spellings that don't even look similar as text, e.g. via
+        # a shared phone number) rather than writing yet another row keyed
+        # on this spelling's own hash. The group is a cheaper, already-made
+        # "same place" decision - this doesn't need to re-derive it from
+        # text similarity, which is all cache_key()/_fuzzy_lookup() alone
+        # could ever do.
+        siblings = _docs_by_group(drs_memo_group)
+        if siblings:
+            # address_normalized/address_raw/geocode_address_raw are left
+            # OUT of this update on purpose. A Firestore document's id is
+            # fixed at creation - here, cache_key() of whichever spelling
+            # this doc was FIRST written under - and can never change to
+            # match a later spelling. Overwriting the scalar
+            # address_normalized field to this spelling's text would make
+            # it claim an id it doesn't actually have, so a later, ungrouped
+            # write for that exact same text (see _exact_lookup/save below)
+            # would compute cache_key() of it, find nothing at THAT id, and
+            # wrongly create a duplicate doc instead of finding this one.
+            # Only the array (which _exact_lookup also checks) is grown.
+            sibling_payload = {
+                k: v for k, v in payload.items()
+                if k not in ("address_normalized", "address_raw", "geocode_address_raw")
+            }
+            siblings[0].reference.update({
+                **sibling_payload,
+                "address_normalized_variants": firestore.ArrayUnion([normalized]),
+            })
+            return
 
     doc_ref = _collection().document(cache_key(normalized))
     # An existing entry keeps its ops verdict and hit count; only the geocode
@@ -318,8 +379,31 @@ def save_to_cache(
         doc_ref.update(payload)
         return
 
+    # This exact spelling has no doc of its own - but it may already be a
+    # recorded VARIANT of another doc (absorbed there under a drs_memo_group
+    # by an earlier write, possibly one this call has no group for - e.g. a
+    # DRS-unaware preview geocode running after a grouped save already
+    # claimed this text). That other doc's real id is whatever ITS first
+    # spelling hashed to, which is never `cache_key(normalized)` for a
+    # variant spelling - so without this check, every such write would
+    # wrongly create a fresh duplicate here every single time.
+    variant_matches = list(
+        _collection()
+        .where("address_normalized_variants", "array_contains", normalized)
+        .limit(1)
+        .stream()
+    )
+    if variant_matches:
+        sibling_payload = {
+            k: v for k, v in payload.items()
+            if k not in ("address_normalized", "address_raw", "geocode_address_raw")
+        }
+        variant_matches[0].reference.update(sibling_payload)
+        return
+
     doc_ref.set({
         **payload,
+        "address_normalized_variants": [normalized],
         "verified": False,
         "verified_by": None,
         "verified_at": None,
@@ -327,3 +411,28 @@ def save_to_cache(
         "created_at": firestore.SERVER_TIMESTAMP,
     })
 
+
+def verify_cache_group(drs_memo_group: str, verified_by: str) -> int:
+    """Mark every geocode_cache entry in one DRS-memo group as verified.
+
+    For the end-of-DRS verification step: when an executive verifies one
+    address, the other spellings of it seen in the same DRS (which reused its
+    pin via the DRS memo) become servable too. Returns the number updated.
+    """
+    if not drs_memo_group:
+        return 0
+    docs = list(
+        _collection().where("drs_memo_group", "==", drs_memo_group).stream()
+    )
+    if not docs:
+        return 0
+    batch = get_fs_client().batch()
+    for doc in docs:
+        batch.update(doc.reference, {
+            "verified": True,
+            "verified_by": verified_by,
+            "verified_at": firestore.SERVER_TIMESTAMP,
+        })
+    batch.commit()
+    invalidate_snapshot()
+    return len(docs)
