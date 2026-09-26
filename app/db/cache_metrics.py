@@ -31,7 +31,8 @@ def write_drs_cache_metrics(
 
     for drs_id, counts in metrics_by_drs.items():
         lookups = counts["cacheLookups"]
-        hits = counts["exactHits"] + counts["fuzzyHits"]
+        master_waypoint_hits = counts.get("masterWaypointHits", 0)
+        hits = master_waypoint_hits + counts["exactHits"] + counts["fuzzyHits"]
         payload = {
             "runId": run_id,
             "drsId": drs_id,
@@ -41,6 +42,7 @@ def write_drs_cache_metrics(
             "consignmentsProcessed": counts["consignmentsProcessed"],
             "invalidAddresses": counts["invalidAddresses"],
             "cacheLookups": lookups,
+            "masterWaypointHits": master_waypoint_hits,
             "exactHits": counts["exactHits"],
             "fuzzyHits": counts["fuzzyHits"],
             "misses": counts["misses"],

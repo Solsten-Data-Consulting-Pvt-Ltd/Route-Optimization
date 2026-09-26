@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pygeohash as pgh
 
 from app.config import GEOHASH_BUILDING_LEN, GEOHASH_LOCALITY_LEN, GOOGLE_MAPS_API_KEY
+from app.db import feature_flags, master_waypoint
 from app.db.bigquery import fetch_rows_by_consignment_ids, merge_routing_rows
 from app.db.cache_metrics import write_drs_cache_metrics
 from app.db.firestore import get_consignments_by_id, upsert_consignments_routing
@@ -74,11 +75,27 @@ def _failed_row(drs_no, drs_id, driver_numeric_id, consignment_id,
 
 
 def _geocode(address, lookup_address=None):
-    """Cache first, Places on a miss. A cache failure never fails the save.
+    """Master-waypoint first (flag-gated), then cache, then Places on a miss.
+    A cache or master-waypoint failure never fails the save.
 
     Fix 1 — `lookup_address` (receiver_address without name prefix) is
     forwarded to the cache functions so that the cache key is location-only.
+
+    Master-waypoint tier (spec.md §5.3): gated behind the `master_waypoint_v2`
+    flag. Flag off -> this block never runs, behavior is identical to before
+    this tier existed. Flag on -> an exact alias hit resolves for $0, no
+    Places API call, ahead of even a geocache hit.
     """
+    if feature_flags.is_enabled("master_waypoint_v2"):
+        try:
+            waypoint_hit = master_waypoint.lookup(lookup_address or address)
+        except Exception:
+            logger.exception("Master-waypoint lookup failed for '%s'", address[:80])
+            waypoint_hit = None
+        if waypoint_hit:
+            logger.info("Master-waypoint hit for '%s'", address[:80])
+            return waypoint_hit, None, None, "master_waypoint_hit"
+
     try:
         cached, cache_outcome = get_cached_geocode_with_outcome(
             address, lookup_address=lookup_address
@@ -109,6 +126,7 @@ def _new_drs_cache_counts(drs_no):
         "consignmentsProcessed": 0,
         "invalidAddresses": 0,
         "cacheLookups": 0,
+        "masterWaypointHits": 0,
         "exactHits": 0,
         "fuzzyHits": 0,
         "misses": 0,
@@ -206,7 +224,9 @@ def save_consignments_pipeline(consignment_ids):
             lookup_address=receiver_address or None,
         )
         drs_metrics["cacheLookups"] += 1
-        if cache_outcome == "exact_hit":
+        if cache_outcome == "master_waypoint_hit":
+            drs_metrics["masterWaypointHits"] += 1
+        elif cache_outcome == "exact_hit":
             drs_metrics["exactHits"] += 1
         elif cache_outcome == "fuzzy_hit":
             drs_metrics["fuzzyHits"] += 1
@@ -215,7 +235,7 @@ def save_consignments_pipeline(consignment_ids):
         else:
             drs_metrics["cacheErrors"] += 1
 
-        if cache_outcome not in ("exact_hit", "fuzzy_hit"):
+        if cache_outcome not in ("exact_hit", "fuzzy_hit", "master_waypoint_hit"):
             drs_metrics["apiCalls"] += 1
         geocode_error = error_reason
         geocode_status = "success" if geocode_result else "failed"
@@ -288,6 +308,7 @@ def save_consignments_pipeline(consignment_ids):
                 "consignmentsProcessed": counts["consignmentsProcessed"],
                 "invalidAddresses": counts["invalidAddresses"],
                 "cacheLookups": counts["cacheLookups"],
+                "masterWaypointHits": counts["masterWaypointHits"],
                 "exactHits": counts["exactHits"],
                 "fuzzyHits": counts["fuzzyHits"],
                 "misses": counts["misses"],
@@ -295,7 +316,10 @@ def save_consignments_pipeline(consignment_ids):
                 "apiCalls": counts["apiCalls"],
                 "apiFailures": counts["apiFailures"],
                 "hitRate": round(
-                    ((counts["exactHits"] + counts["fuzzyHits"]) / counts["cacheLookups"]) * 100,
+                    (
+                        (counts["masterWaypointHits"] + counts["exactHits"] + counts["fuzzyHits"])
+                        / counts["cacheLookups"]
+                    ) * 100,
                     2,
                 ) if counts["cacheLookups"] else 0.0,
             }

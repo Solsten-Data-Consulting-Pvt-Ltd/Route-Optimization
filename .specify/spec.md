@@ -2,7 +2,7 @@
 
 **Purpose of this document:** this is a **developer aid**, not just a requirements list. None of the terms and concepts below (master waypoint, HILT, the solitary-outlier trap, "Anchor & Hitchhiker") exist anywhere in this repository, its README, or any other written source today — they only exist in the conversation that produced this document (plus one prior Gemini chat). This file is now the single source of truth for them. Read the Glossary before the rest; it's referenced throughout.
 
-**Status:** Draft — scope confirmed with the repo owner; ready for `/speckit.plan`.
+**Status:** §5.6 (Config & feature flags) and §5.3 (Master-waypoint tier) are **implemented**, flag-gated, default OFF (see `app/db/feature_flags.py`, `app/db/master_waypoint.py`, wired into `app/services/save.py:_geocode()`; tests in `tests/test_feature_flags.py`, `tests/test_master_waypoint.py`). §5.1, §5.2, §5.4, §5.5 remain planned, not built. If you're new to how this doc leads to shipped code, read `.specify/HOW_TO.md` first.
 
 ---
 
@@ -109,9 +109,9 @@ A stop only ever falls into the highest tier its distance qualifies for (10km �
 
 **Blast radius:** new pre-check function, likely in `app/services/sorting.py` ahead of `solve_route_order`; reuses `tsp.py:17` haversine, adds no new distance math. `write_group_assignments` (`bigquery.py:199`) is skipped only for stops in the Blocked tier, not Suggestion/Medium.
 
-### 5.3 Master-waypoint tier
+### 5.3 Master-waypoint tier — **implemented**, flag `master_waypoint_v2`
 
-New module (e.g. `app/db/master_waypoint.py`, mirroring `geocache.py`'s structure) + new Firestore collection (e.g. `master_waypoints`): alias → verified lat/lon, `verified: bool`, `confirmation_count: int`. Checked first in `_geocode()` (`save.py:76`), ahead of the existing `get_cached_geocode_with_outcome` call. A `verified: True` entry is immutable — no code path except the promotion rule below may overwrite it.
+New module `app/db/master_waypoint.py` (mirrors `geocache.py`'s structure) + new Firestore collection `master_waypoints`: alias → verified lat/lon, `verified: bool`, `pending_confirmations`. Checked first in `_geocode()` (`save.py:76`), ahead of the existing `get_cached_geocode_with_outcome` call, gated by `feature_flags.is_enabled("master_waypoint_v2")` (§5.6) — off by default, so today's behavior is unchanged until someone flips it on. A `verified: True` entry is immutable — no code path except `record_confirmation()`'s promotion rule below may overwrite it. `seed()` is the ops entry point for adding a known-good anchor; it also refuses to touch an existing verified entry. `record_confirmation()` is implemented and tested but has no live caller yet — it's what §5.4's EOD endpoint will call once that's built. Tests: `tests/test_master_waypoint.py`.
 
 **Promotion rule:** an EOD confirmation (§5.4) that corrects a point increments `confirmation_count` for that alias; on the **3rd distinct confirmation** of the same corrected coordinate, it's promoted/updated. This is the one sanctioned exception to immutability.
 
@@ -224,7 +224,9 @@ Processing (new function, e.g. `app/services/eod_feedback.py`, called from a new
 
 **Blast radius:** new BQ dataset/table for embeddings, a BQML remote model resource, a Vertex AI connection (GCP infra, provisioned outside application code), and an offline evaluation script outside `app/`. No production code path calls `ML.GENERATE_EMBEDDING` in this phase.
 
-### 5.6 Configuration & feature flags
+### 5.6 Configuration & feature flags — **implemented**
+
+`app/db/feature_flags.py` exists and matches the design below: `app_config` Firestore collection, TTL-cached snapshot accessor (`is_enabled`, `get_flag`, `get_value`), `seed_default_flags()` to idempotently create the five flags this spec names (all seeded disabled), `invalidate_snapshot()` for a manual/test-time reset. Tests: `tests/test_feature_flags.py`. Not yet built: an actual admin UI/CLI for flipping a flag in the deployed Firestore instance — today that's a manual Firestore console/`gcloud` write, or calling `seed_default_flags()`/writing a doc directly from a one-off script. §5.1/§5.2/§5.4/§5.5 don't exist yet, so their flags (`geocoding_ambiguity_v2`, `outlier_trap_v2`, `eod_ingestion_v2`, `bqml_embeddings_eval`) are defined in `DEFAULT_FLAGS` but have no code checking them yet — only `master_waypoint_v2` has a live caller (§5.3).
 
 This repo is a live prod API (Cloud Run, two endpoints in active use today). Every requirement in §5.1–§5.5 is new behavior being added to that live request path, so this section is itself a requirement, not tooling on the side: **nothing above ships without a flag.**
 
