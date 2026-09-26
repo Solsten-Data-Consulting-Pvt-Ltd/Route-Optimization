@@ -338,11 +338,26 @@ Per-requirement blast radius is stated inline in §5; this table is the cross-cu
 | BigQuery (operational store) | `app/db/bigquery.py` | Extended with `delivery_audit` (§5.4) and the embeddings table (§5.5) |
 | Firestore | `app/db/firestore.py` | Extended with `master_waypoints` (§5.3) and a HILT queue collection |
 | RapidFuzz | `app/db/geocache.py` | Reused for master-waypoint alias matching |
-| API reference docs | `README.md:117-121,126,155,390-512` + FastAPI auto-docs (`/docs`, `/redoc` — live, not disabled in `main.py:10`) | Existing developer-facing doc pattern (endpoint table + request/response examples + curl/Postman). New endpoints (`/eod-delivery-feedback`, §5.4) should follow the same pattern; Pydantic models should gain field descriptions since `/docs` today only auto-generates from bare field names |
+| API reference docs | `README.md:117-121,126,155,390-512` + FastAPI auto-docs (`/docs`, `/redoc` — live, not disabled in `main.py:10`) | Existing developer-facing doc pattern (endpoint table + request/response examples + curl/Postman). New endpoints (`/eod-delivery-feedback`, §5.4) should follow the same pattern — see §8 for a gap in this pattern today |
 
 ---
 
-## 8. Out of scope for now (documented, not just deferred silently)
+## 8. Tech debt (found while reading the code for this spec, not invented)
+
+None of this blocks §5, but it's real, verified against the current code (not guessed), and worth tracking as its own backlog rather than leaving scattered as asides. Two items (TD-1, TD-4) directly touch files this spec is about to extend, so fixing them first lowers the risk of §5.1/§5.2 rather than being unrelated cleanup.
+
+| ID | Item | Where | Why it matters | Suggested fix |
+|---|---|---|---|---|
+| **TD-1** | Pydantic request models have no field-level descriptions | `app/schemas.py` — `SaveConsignmentsRequest`, `RunSortingRequest` (and the new `EodDeliveryFeedbackRequest` in §5.4 will inherit the same gap if not addressed) | FastAPI's `/docs`/`/redoc` (§7) auto-generate from these models — today they render with bare field names and no explanation, so the "developer portal" is thinner than it could be for free | Add `Field(description="...")` to every field; near-zero cost, direct payoff in the auto-generated docs |
+| **TD-2** | `GEOCODE_URL` defined but never called | `app/config.py:12` | Dead config — the classic Google Geocoding API endpoint is defined but `geocoding.py` only ever calls `PLACES_SEARCH_URL` (Places API v1). Confirmed via repo-wide search: zero call sites. | Remove it, or if a future switch to the classic Geocoding API is actually planned, say so in a comment — right now it's just a trap for a future reader assuming it's live |
+| **TD-3** | `get_cached_geocode()` has no callers anywhere in this repo | `app/db/geocache.py:268` | Its own docstring calls it a "compatibility wrapper," but nothing in `app/`, `tests/`, or `scratch/` calls it — confirmed via repo-wide search. Either it's dead code, or it exists for a consumer outside this repo that isn't documented anywhere. | Confirm with whoever added it whether an external caller exists; if not, remove it — if so, note that dependency here so it doesn't get deleted by accident later |
+| **TD-4** | `write_group_assignments` builds SQL via unparameterized string interpolation | `app/db/bigquery.py:199-235`, specifically the `CASE WHEN sorting_id = '{u["sorting_id"]}' THEN '{u["starting_address"]}'` pattern | Every other query in this same file uses `bigquery.ScalarQueryParameter`/`ArrayQueryParameter` (see `merge_routing_rows`, `fetch_active_rows_for_drs`). This one function f-strings raw values straight into the query, including `starting_address` — a free-text field (from `drs_starting_point.starting_address` in Firestore) that can legitimately contain an apostrophe (e.g. "St. Mary's Church area"), which would break the query syntactically today, not just in theory. §5.2's outlier trap and §5.6's flag-gated writes will add more call sites feeding this same function. | Rewrite to use parameterized queries (e.g. a temp table + `MERGE`, matching the pattern `merge_routing_rows` already uses) before adding new callers on top of it |
+| **TD-5** | `location_type` is threaded through the whole pipeline but always `None` | Originates at `app/services/geocoding.py:154` (hardcoded `None`), then carried through `schemas`/`save.py`/`bigquery.py`/`firestore.py` end-to-end | A column that exists in every layer (BQ, Firestore, the MERGE SQL) but has never carried real data since Places API v1 doesn't populate it the way the classic Geocoding API did — vestigial from the port. Not harmful, but worth knowing before anyone builds new logic assuming it's populated (e.g. §5.1's bounds/candidate logic should not rely on it). | Either populate it from Places API's available signals, or document plainly that it's currently always null, so §5.1 doesn't accidentally depend on it |
+| **TD-6** | No automated test coverage for `sorting.py`, `tsp.py`, or any BigQuery write function | `tests/` only covers `test_geocache_matching.py`, `test_geocode_accuracy.py`, `test_cache_metrics.py` — nothing exercises `run_sorting_pipeline`, `compute_groups_and_sequence`, `solve_route_order`, or `write_group_assignments`/`merge_routing_rows` | §5.2 (solitary-outlier trap) adds new logic directly into `sorting.py`, the exact module with zero test coverage today. Shipping a distance-threshold gate with no tests, even behind a flag, is the riskiest way to add it. | Add unit tests for `compute_groups_and_sequence` (at least: delivered-slot preservation, the outlier tiers once built) before or alongside §5.2, not after |
+
+---
+
+## 9. Out of scope for now (documented, not just deferred silently)
 
 | Item | Why it's out | Revisit condition |
 |---|---|---|
@@ -353,9 +368,10 @@ Per-requirement blast radius is stated inline in §5; this table is the cross-cu
 
 ---
 
-## 9. Open items still needing confirmation
+## 10. Open items still needing confirmation
 
 1. Exact solitary-outlier distance threshold (10km used above as the number given in conversation — confirm before implementing).
 2. Firestore vs. BigQuery for the `master_waypoints` collection (this doc assumes Firestore, matching `geocache.py`'s low-latency pattern).
 3. Who owns pushing the recommended EOD/mobile-app change (§5.4) to that system's team, and their own timeline — this repo can only wait and receive once it's built.
 4. BQML evaluation (§5.5) owner and decision deadline, since it's explicitly not wired into production yet.
+5. Whether TD-2/TD-3 (dead `GEOCODE_URL`, unused `get_cached_geocode()`) have an external caller nobody's documented, before removing either.
