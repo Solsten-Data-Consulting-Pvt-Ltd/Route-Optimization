@@ -55,6 +55,11 @@ def _row_to_struct_param(row):
         bigquery.ScalarQueryParameter("overriddenAt", "TIMESTAMP", row["overriddenAt"]),
         bigquery.ScalarQueryParameter("planned_latitude", "FLOAT64", row["planned_latitude"]),
         bigquery.ScalarQueryParameter("planned_longitude", "FLOAT64", row["planned_longitude"]),
+        # Address resolution (nullable STRING columns; see README "Address
+        # resolution" for the one-time ALTER TABLE). .get(): rows built by
+        # older callers without these keys still bind as NULL.
+        bigquery.ScalarQueryParameter("geocode_resolution", "STRING", row.get("geocode_resolution")),
+        bigquery.ScalarQueryParameter("geocode_source", "STRING", row.get("geocode_source")),
     )
 
 
@@ -101,6 +106,8 @@ MERGE_SQL = f"""
         T.locationOverridden = S.locationOverridden,
         T.overriddenBy = S.overriddenBy,
         T.overriddenAt = S.overriddenAt,
+        T.geocode_resolution = S.geocode_resolution,
+        T.geocode_source = S.geocode_source,
         T.updated_at = CURRENT_TIMESTAMP()
     WHEN NOT MATCHED THEN INSERT (
         sorting_id, drsNo, drsId, driverNumericId, consignmentId,
@@ -115,6 +122,7 @@ MERGE_SQL = f"""
         geocode_status, geocode_error,
         locationOverridden, overriddenBy, overriddenAt,
         planned_latitude, planned_longitude,
+        geocode_resolution, geocode_source,
         created_at, updated_at
     ) VALUES (
         GENERATE_UUID(), S.drsNo, S.drsId, S.driverNumericId, S.consignmentId,
@@ -128,6 +136,7 @@ MERGE_SQL = f"""
         S.geocode_status, S.geocode_error,
         S.locationOverridden, S.overriddenBy, S.overriddenAt,
         S.planned_latitude, S.planned_longitude,
+        S.geocode_resolution, S.geocode_source,
         CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
     )
 """

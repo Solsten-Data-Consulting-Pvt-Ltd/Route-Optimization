@@ -158,6 +158,10 @@ def _save_routing_doc(row):
         "country_code": getattr(row, "country_code", None),
         "geocode_status": getattr(row, "geocode_status", None),
         "geocode_error": getattr(row, "geocode_error", None),
+        # Address resolution — save-owned like the fields above; never in
+        # _base_routing_doc, so a re-optimize can't overwrite them.
+        "geocode_resolution": getattr(row, "geocode_resolution", None),
+        "geocode_source": getattr(row, "geocode_source", None),
     })
     return doc
 

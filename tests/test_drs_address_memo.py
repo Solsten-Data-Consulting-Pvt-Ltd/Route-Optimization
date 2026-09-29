@@ -255,7 +255,7 @@ class GeocodeOrderTests(unittest.TestCase):
 
     def test_second_parcel_reuses_first_without_places(self):
         (r1, *_), calls1 = self._geocode(LIKHITHA_1, "C1")
-        (r2, _, _, outcome), calls2 = self._geocode(LIKHITHA_2, "C2")
+        (r2, _, _, outcome, _cls), calls2 = self._geocode(LIKHITHA_2, "C2")
         self.assertEqual((calls1, calls2), (1, 0))
         self.assertEqual(outcome, "drs_hit")
         self.assertEqual((r2["latitude"], r2["longitude"]), (r1["latitude"], r1["longitude"]))
@@ -265,14 +265,14 @@ class GeocodeOrderTests(unittest.TestCase):
     def test_verified_cache_beats_memo_api_pin(self):
         self._geocode(LIKHITHA_1, "C1")
         verified = {"latitude": 1.0, "longitude": 2.0, "types": []}
-        (r, _, _, outcome), calls = self._geocode(LIKHITHA_2, "C2", cache=(verified, "exact_hit"))
+        (r, _, _, outcome, _cls), calls = self._geocode(LIKHITHA_2, "C2", cache=(verified, "exact_hit"))
         self.assertEqual((outcome, calls, r["latitude"]), ("exact_hit", 0, 1.0))
 
     def test_executive_correction_today_beats_verified_cache(self):
         drs_memo.remember("DRS-KODATHI", info(LIKHITHA_1), {"latitude": 9.0, "longitude": 9.0},
                           drs_memo.SOURCE_EXEC_CORRECTED, consignment_id="C1")
         verified = {"latitude": 1.0, "longitude": 2.0, "types": []}
-        (r, _, _, outcome), _ = self._geocode(LIKHITHA_2, "C2", cache=(verified, "exact_hit"))
+        (r, _, _, outcome, _cls), _ = self._geocode(LIKHITHA_2, "C2", cache=(verified, "exact_hit"))
         self.assertEqual((outcome, r["latitude"]), ("drs_hit", 9.0))
 
     def test_api_pin_never_overwrites_executive_correction(self):

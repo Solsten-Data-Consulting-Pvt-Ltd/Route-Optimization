@@ -60,9 +60,12 @@ class PreviewGeocodeTests(unittest.TestCase):
 
     def test_unresolvable_address_fails_without_raising(self):
         with patch.object(save_mod, "_geocode",
-                          return_value=(None, "Address could not be found.", "ZERO", "miss")):
+                          return_value=(None, "Address could not be found.",
+                                        "ADDRESS_NOT_FOUND", "miss")):
             out = save_mod.preview_geocode(None, "nowhere at all")
-        self.assertEqual(out, {"status": "failed", "error": "Address could not be found."})
+        # resolution added by the address-resolution change; status/error unchanged.
+        self.assertEqual(out, {"status": "failed", "error": "Address could not be found.",
+                               "resolution": "ZERO_RESULTS"})
 
     def test_blank_address_fails_without_geocoding(self):
         with patch.object(save_mod, "_geocode") as g:

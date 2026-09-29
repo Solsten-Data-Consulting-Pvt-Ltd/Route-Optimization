@@ -160,6 +160,54 @@ days).
 
 ---
 
+## Address resolution
+
+Every geocode result gets three routing fields (codes in
+`app/services/geocode_codes.py`; the 3PL apps read these exact names):
+
+| Field | Values |
+|-------|--------|
+| `geocode_status` | `success` · `needs_review` · `failed` |
+| `geocode_resolution` (new) | `KNOWN_GOOD` · `CONFIDENT` · `ZERO_RESULTS` · `MISSING_ADDRESS` · `SERVICE_ERROR` · `MULTI_CANDIDATE` · `PINCODE_MISMATCH` |
+| `geocode_source` (new) | `confirmed` · `preview` · `admin` · `memo_corrected` · `memo` · `cache_exact` · `cache_fuzzy` · `places` · `places_retry` |
+
+`MULTI_CANDIDATE` and `PINCODE_MISMATCH` rows are `needs_review`: saved with a
+pin and **still routed**, flagged for admin. Only `ZERO_RESULTS` /
+`MISSING_ADDRESS` block the executive.
+
+**Feature flag `featureFlags/geocodeResolutionV2`** (starts off).
+
+| | Flag off (today) | Flag on |
+|---|---|---|
+| Pin choice | `places[0]`, one query | up to 5 candidates; prefer the address's pincode; > 300 m apart → `MULTI_CANDIDATE` |
+| Zero results | `failed` | one retry with a shortened address first (`places_retry`) |
+| `geocode_status` | `success` / `failed` only | adds `needs_review` |
+| `geocode_error` | today's text | one standard message per resolution |
+| Accepted preview pin | as today | carries the preview's `resolution` and `pincode` |
+| `geocode_resolution` / `geocode_source` | **filled in** | filled in |
+
+**API (all additive/optional).** `/geocode/preview` returns `resolution`,
+`source`, `pincode` (doubtful pins stay `status: "success"`; failures return
+`resolution: ZERO_RESULTS | SERVICE_ERROR | MISSING_ADDRESS`) and accepts
+`addressComponents`. `ConfirmedLocation` in `/save-consignments` accepts
+`resolution`, `source` (`"admin"` for admin fixes) and `pincode`.
+
+**One-time schema change — run before deploying, dev first, then prod:**
+
+```sql
+ALTER TABLE `<project>.Hermes_Exports.consignments_routing`
+  ADD COLUMN IF NOT EXISTS geocode_resolution STRING,
+  ADD COLUMN IF NOT EXISTS geocode_source STRING;
+```
+
+The MERGE writes both columns, so a deploy without them fails every save.
+
+**Rollout:** ALTER TABLE (dev) → deploy with the flag off and count rows by
+`geocode_resolution` for 2–3 days → deploy the 3PL side → flag on in dev,
+then prod. Turning the flag off takes effect within 45 s, no redeploy.
+
+---
+
 ## Endpoints
 
 | Method | Path | Purpose |
@@ -238,6 +286,7 @@ a `message` is returned.
 |-------|--------------|-----|
 | Firestore `consignments` | read | Source consignment documents (receiver name and address) |
 | Firestore `geocode_cache` | read + write | Previously geocoded addresses. Only entries flagged `verified: true` are reused; new entries are stored as `verified: false` |
+| Firestore `featureFlags` | read | 3PL's flag collection. `geocodeResolutionV2` (`enabled: true`) turns on address resolution; cached 45 s, missing/error = off |
 | Firestore `drs_address_memo` | read + write | One document per DRS: pins already resolved in that DRS, reused for later same-place consignments. Needs a TTL policy on `expires_at` |
 | Firestore `drs_cache_metrics` | write | One aggregate cache summary per DRS save run: exact/fuzzy hits, misses, API calls, and hit rate. This is written after the routing save and never blocks it. |
 | Firestore `drs_starting_point` | read | Hub/depot lat/lon and address, keyed by DRS number |

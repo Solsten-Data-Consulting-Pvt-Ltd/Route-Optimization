@@ -18,6 +18,7 @@ def geocode_preview(payload: GeocodePreviewRequest):
         return preview_geocode(
             payload.receiverName, payload.receiverAddress,
             drs_id=payload.drsId, consignment_id=payload.consignmentId,
+            address_components=payload.addressComponents,
         )
     except Exception as e:
         logger.exception("geocode_preview failed")

@@ -76,3 +76,34 @@ def build_geocode_address(receiver_name: str, receiver_address: str) -> str:
         return f"{name}, {addr}"
 
     return addr or name
+
+
+# Unit-level tokens that often make Places return nothing ("Flat 3B, 2nd
+# floor, Wing C, ..."). Each match runs to the next comma. `#` has no word
+# boundary before it, hence the look-behind instead of \b.
+UNIT_TOKENS = re.compile(
+    r"(?:(?<![\w])(?:\d+(?:st|nd|rd|th)\s+)?(?:flat\s+no|flat|floor|flr|wing|room|door\s+no|house\s+no)\b|#)[^,]*,?",
+    re.IGNORECASE,
+)
+
+RETRY_COMPONENT_KEYS = ("premise", "sub_locality", "locality", "city", "postal_code")
+
+
+def build_retry_address(receiver_address, components=None):
+    """Shortened query for ONE retry after Places returns zero results.
+
+    Prefers the OCR address components 3PL stores on the consignment
+    (receiver.addressComponent): premise, sub_locality/locality, city,
+    postal_code. Without them, strips unit tokens (flat, floor, wing, room,
+    door/house no, #...) from the address. Returns None when the result is
+    empty or no different from the original, so no pointless retry is made.
+    """
+    if components:
+        parts = [str(components.get(k) or "").strip() for k in RETRY_COMPONENT_KEYS]
+        text = ", ".join(p for p in parts if p)
+    else:
+        text = UNIT_TOKENS.sub("", receiver_address or "")
+    text = normalize_to_single_line(text)
+    text = re.sub(r"\s*,\s*(,\s*)+", ", ", text).strip(" ,")
+    original = normalize_to_single_line(receiver_address or "")
+    return text if text and text != original else None

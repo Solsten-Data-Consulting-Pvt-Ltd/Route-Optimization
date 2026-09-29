@@ -14,14 +14,21 @@ from app.db.bigquery import (
 )
 from app.db.cache_metrics import write_drs_cache_metrics
 from app.db.firestore import get_consignments_by_id, upsert_consignments_routing
-from app.db import drs_memo
+from app.db import drs_memo, feature_flags
 from app.db.geocache import get_cached_geocode_with_outcome, save_to_cache
-from app.services.address import build_geocode_address, normalize_to_single_line
+from app.services import geocode_codes as codes
+from app.services.address import (
+    build_geocode_address,
+    build_retry_address,
+    extract_pincode,
+    normalize_to_single_line,
+)
 from app.services.address_match import consignment_match_info, match_info_from_address
 from app.services.geocoding import (
     derive_exception_flag,
     derive_is_commercial,
     places_search_address,
+    places_search_classified,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,8 +40,13 @@ def build_row(drs_no, drs_id, driver_numeric_id, consignment_id, receiver_addres
               street_number=None, route_name=None, district=None, state=None, country_code=None,
               geocode_status="success", geocode_error=None,
               location_overridden=False, overridden_by=None, overridden_at=None,
-              planned_latitude=None, planned_longitude=None):
+              planned_latitude=None, planned_longitude=None,
+              geocode_resolution=None, geocode_source=None):
     """Build one row dict for BigQuery/Firestore.
+
+    geocode_resolution / geocode_source: the formal reason code and where the
+    pin came from (app/services/geocode_codes.py). Always filled in, even with
+    geocodeResolutionV2 off, so the distribution can be measured first.
 
     planned_latitude/planned_longitude are the FIRST point this consignment
     ever resolved to (auto-geocode or a very first manual placement) — the
@@ -80,11 +92,14 @@ def build_row(drs_no, drs_id, driver_numeric_id, consignment_id, receiver_addres
         "overriddenAt": overridden_at,
         "planned_latitude": planned_latitude,
         "planned_longitude": planned_longitude,
+        "geocode_resolution": geocode_resolution,
+        "geocode_source": geocode_source,
     }
 
 
 def _failed_row(drs_no, drs_id, driver_numeric_id, consignment_id,
-                receiver_address, receiver_name, geocode_address_str, reason):
+                receiver_address, receiver_name, geocode_address_str, reason,
+                resolution=None):
     return build_row(
         drs_no, drs_id, driver_numeric_id, consignment_id,
         receiver_address, receiver_name, geocode_address_str,
@@ -92,7 +107,41 @@ def _failed_row(drs_no, drs_id, driver_numeric_id, consignment_id,
         None, False,
         geocode_status="failed",
         geocode_error=reason,
+        geocode_resolution=resolution,
+        geocode_source=None,
     )
+
+
+def _use_v2():
+    """geocodeResolutionV2, read once per request. Any error counts as off."""
+    try:
+        return feature_flags.geocode_resolution_v2()
+    except Exception:
+        logger.exception("Feature flag lookup failed; geocodeResolutionV2 off")
+        return False
+
+
+def _components_of(receiver):
+    """OCR address components on the consignment (3PL stores them as
+    receiver.addressComponent; addressComponents accepted too)."""
+    receiver = receiver or {}
+    comp = receiver.get("addressComponent") or receiver.get("addressComponents")
+    return comp if isinstance(comp, dict) else None
+
+
+def _unpack_geocode(res):
+    """_geocode's result as (result, reason, code, outcome, resolution, source).
+    Tolerates the older 4-value shape (resolution/source then None)."""
+    result, reason, code, outcome = res[:4]
+    resolution, source = res[4] if len(res) > 4 and res[4] else (None, None)
+    return result, reason, code, outcome, resolution, source
+
+
+def _pincode_resolution(result, default):
+    """PINCODE_MISMATCH when the (recomputed) pincode_match is False."""
+    if result and result.get("pincode_match") is False:
+        return codes.PINCODE_MISMATCH
+    return default
 
 
 def _safe(fn, *args, **kwargs):
@@ -104,8 +153,20 @@ def _safe(fn, *args, **kwargs):
         return None
 
 
-def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignment_id):
+_MEMO_KNOWN_GOOD_SOURCES = {
+    drs_memo.SOURCE_EXEC_CORRECTED, drs_memo.SOURCE_EXEC_ACCEPTED, drs_memo.SOURCE_GLOBAL_CACHE,
+}
+
+
+def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignment_id,
+              corrected_tier=False):
     result = drs_memo.result_from_entry(entry, address)
+    if corrected_tier:
+        classification = (codes.KNOWN_GOOD, codes.SOURCE_MEMO_CORRECTED)
+    elif entry.get("source") in _MEMO_KNOWN_GOOD_SOURCES:
+        classification = (codes.KNOWN_GOOD, codes.SOURCE_MEMO)
+    else:  # api entry: resolution comes from the entry's source, no schema change
+        classification = (_pincode_resolution(result, codes.CONFIDENT), codes.SOURCE_MEMO)
     logger.info("DRS memo hit (%s, source=%s) drs=%s for '%s'",
                 reason, entry.get("source"), drs_id, address[:80])
     _safe(drs_memo.link, drs_id, entry_id,
@@ -116,11 +177,11 @@ def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignm
     if lookup_address and lookup_address not in (entry.get("variants") or []):
         _safe(save_to_cache, address, result, lookup_address=lookup_address,
               source="drs_memo", drs_memo_group=drs_memo.group_id(drs_id, entry_id))
-    return result, None, None, "drs_hit"
+    return result, None, None, "drs_hit", classification
 
 
 def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
-             consignment_id=None):
+             consignment_id=None, use_v2=False, retry_address=None):
     """Resolve a pin. Order:
 
       1. DRS memo, executive-corrected entries only (a correction made in this
@@ -135,6 +196,19 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
 
     Fix 1 — `lookup_address` (receiver_address without name prefix) is
     forwarded to the cache functions so that the cache key is location-only.
+
+    Returns (result, error_reason, error_code, cache_outcome,
+    (resolution, source)) — the 5th value classifies every tier:
+
+      1 memo, corrected entry  KNOWN_GOOD                      memo_corrected
+      2 verified cache         KNOWN_GOOD / PINCODE_MISMATCH   cache_exact / cache_fuzzy
+      3 memo, any entry        KNOWN_GOOD (exec/cache entry),  memo
+                               CONFIDENT / PINCODE_MISMATCH (api entry)
+      4 Places (+ v2 retry)    classify_places()               places / places_retry
+      failure                  ZERO_RESULTS / SERVICE_ERROR    None
+
+    `use_v2` (geocodeResolutionV2) enables the multi-candidate pick and the
+    one `retry_address` retry; off, step 4 is today's places_search_address.
     """
     use_memo = bool(drs_id and match_info and match_info.get("entry_id"))
     memo_entries = {}
@@ -150,7 +224,8 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
         hit = drs_memo.find_match(memo_entries, match_info,
                                   sources={drs_memo.SOURCE_EXEC_CORRECTED})
         if hit:
-            return _memo_hit(drs_id, *hit, address, lookup_address, consignment_id)
+            return _memo_hit(drs_id, *hit, address, lookup_address, consignment_id,
+                             corrected_tier=True)
 
     # 2. Verified global cache.
     try:
@@ -168,7 +243,11 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
             _safe(drs_memo.remember, drs_id, match_info, cached, drs_memo.SOURCE_GLOBAL_CACHE,
                   lookup_address=lookup_address, consignment_id=consignment_id,
                   entries=memo_entries)
-        return cached, None, None, cache_outcome
+        source = (codes.SOURCE_CACHE_EXACT if cache_outcome == "exact_hit"
+                  else codes.SOURCE_CACHE_FUZZY)
+        return cached, None, None, cache_outcome, (
+            _pincode_resolution(cached, codes.KNOWN_GOOD), source,
+        )
 
     # 3. Same place already resolved earlier in this DRS.
     if use_memo:
@@ -176,8 +255,16 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
         if hit:
             return _memo_hit(drs_id, *hit, address, lookup_address, consignment_id)
 
-    # 4. Places.
-    geocode_result, error_reason, error_code = places_search_address(address)
+    # 4. Places. Flag off -> exactly today's call and pick.
+    if use_v2:
+        geocode_result, error_reason, error_code, resolution, source = places_search_classified(
+            address, use_v2=True, retry_address=retry_address,
+        )
+    else:
+        geocode_result, error_reason, error_code = places_search_address(address)
+        resolution = (_pincode_resolution(geocode_result, codes.CONFIDENT) if geocode_result
+                      else codes.resolution_for_error(error_code))
+        source = codes.SOURCE_PLACES if geocode_result else None
 
     if geocode_result:
         # Only persist to geocode_cache when there's a real DRS/memo context
@@ -201,11 +288,17 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
                   lookup_address=lookup_address, consignment_id=consignment_id,
                   entries=memo_entries)
 
-    return geocode_result, error_reason, error_code, cache_outcome
+    return geocode_result, error_reason, error_code, cache_outcome, (resolution, source)
 
 
 def _preview_match_context(receiver_address, drs_id, consignment_id):
-    """(drs_id, match_info) for a scan preview.
+    """(drs_id, match_info) for a scan preview — see _preview_context."""
+    drs, info, _components = _preview_context(receiver_address, drs_id, consignment_id)
+    return drs, info
+
+
+def _preview_context(receiver_address, drs_id, consignment_id):
+    """(drs_id, match_info, address_components) for a scan preview.
 
     With a consignmentId the consignment document supplies receiver.phone,
     receiver.fullAddress and addressComponent (and drsId, if not given). With
@@ -222,13 +315,15 @@ def _preview_match_context(receiver_address, drs_id, consignment_id):
             data = docs[0].to_dict() or {}
             drs_id = (drs_id or str(data.get("drsId") or "").strip()
                       or str(data.get("drsNo") or "").strip() or None)
-            return drs_id, consignment_match_info(data.get("receiver") or {})
+            receiver = data.get("receiver") or {}
+            return drs_id, consignment_match_info(receiver), _components_of(receiver)
     if drs_id:
-        return drs_id, match_info_from_address(receiver_address)
-    return None, None
+        return drs_id, match_info_from_address(receiver_address), None
+    return None, None, None
 
 
-def preview_geocode(receiver_name, receiver_address, drs_id=None, consignment_id=None):
+def preview_geocode(receiver_name, receiver_address, drs_id=None, consignment_id=None,
+                    address_components=None):
     """Cache-first, Places-on-miss lookup with no BigQuery/Firestore
     consignments_routing side effects — used to show a pin before a
     consignment is saved.
@@ -236,26 +331,42 @@ def preview_geocode(receiver_name, receiver_address, drs_id=None, consignment_id
     Normalises and builds the address exactly like save_consignments_pipeline's
     per-row geocode step, so a preview and the eventual save agree. A fresh
     Places hit is still written to geocode_cache by _geocode(), as today.
+
+    The response carries the classification (resolution, source, pincode) so
+    the executive's accepted pin can send it back with the save. Doubtful
+    pins (MULTI_CANDIDATE, PINCODE_MISMATCH) stay status "success"; only
+    ZERO_RESULTS / SERVICE_ERROR / MISSING_ADDRESS come back "failed".
     """
     receiver_name = normalize_to_single_line(str(receiver_name or ""))
     receiver_address = normalize_to_single_line(str(receiver_address or ""))
 
     if not receiver_address:
-        return {"status": "failed", "error": "Receiver address is missing."}
+        return {"status": "failed", "error": "Receiver address is missing.",
+                "resolution": codes.MISSING_ADDRESS}
 
     geocode_address_str = build_geocode_address(receiver_name, receiver_address)
 
-    memo_drs_id, match_info = _preview_match_context(
+    memo_drs_id, match_info, doc_components = _preview_context(
         receiver_address, (drs_id or "").strip() or None, (consignment_id or "").strip() or None,
     )
 
-    geocode_result, error_reason, _error_code, _cache_outcome = _geocode(
-        geocode_address_str, lookup_address=receiver_address or None,
-        drs_id=memo_drs_id, match_info=match_info, consignment_id=consignment_id or None,
+    use_v2 = _use_v2()
+    retry_address = (
+        build_retry_address(receiver_address, address_components or doc_components)
+        if use_v2 else None
+    )
+
+    geocode_result, error_reason, error_code, _cache_outcome, resolution, source = _unpack_geocode(
+        _geocode(
+            geocode_address_str, lookup_address=receiver_address or None,
+            drs_id=memo_drs_id, match_info=match_info, consignment_id=consignment_id or None,
+            use_v2=use_v2, retry_address=retry_address,
+        )
     )
 
     if geocode_result is None:
-        return {"status": "failed", "error": error_reason}
+        return {"status": "failed", "error": error_reason,
+                "resolution": resolution or codes.resolution_for_error(error_code)}
 
     return {
         "status": "success",
@@ -263,6 +374,9 @@ def preview_geocode(receiver_name, receiver_address, drs_id=None, consignment_id
         "longitude": geocode_result["longitude"],
         "formatted_address": geocode_result.get("formatted_address"),
         "exception_flag": derive_exception_flag(geocode_result),
+        "resolution": resolution or codes.CONFIDENT,
+        "source": source,
+        "pincode": geocode_result.get("pincode"),
     }
 
 
@@ -280,6 +394,28 @@ def _new_drs_cache_counts(drs_no):
         "apiCalls": 0,
         "apiFailures": 0,
     }
+
+
+def _confirmed_classification(confirmed):
+    """(resolution, source) for an executive/admin-confirmed location.
+
+      corrected=True                -> KNOWN_GOOD, "confirmed" (or "admin")
+      corrected=False + resolution  -> that resolution, "preview"
+                                       (an accepted MULTI_CANDIDATE stays doubtful)
+      corrected=False, none sent    -> CONFIDENT, "preview" (older app builds)
+    """
+    if (confirmed.source or "").strip() == codes.SOURCE_ADMIN:
+        source = codes.SOURCE_ADMIN
+    elif confirmed.corrected:
+        source = codes.SOURCE_CONFIRMED
+    else:
+        source = codes.SOURCE_PREVIEW
+    if confirmed.corrected:
+        return codes.KNOWN_GOOD, source
+    sent = (confirmed.resolution or "").strip()
+    if sent in codes.RESOLUTIONS and sent not in codes.FAILED_RESOLUTIONS:
+        return sent, source
+    return codes.CONFIDENT, source
 
 
 def _dedupe(consignment_ids):
@@ -330,6 +466,7 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
         start_dt.isoformat(), len(consignment_ids),
     )
 
+    use_v2 = _use_v2()
     deduped_ids = _dedupe(consignment_ids)
     docs, not_found_ids = get_consignments_by_id(deduped_ids)
 
@@ -368,7 +505,9 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
             failures.append({"consignmentId": consignment_id, "reason": reason})
             rows_to_merge.append(_failed_row(
                 drs_no, drs_id, driver_numeric_id, consignment_id,
-                receiver_address, receiver_name, geocode_address_str, reason,
+                receiver_address, receiver_name, geocode_address_str,
+                codes.message_for(codes.MISSING_ADDRESS) if use_v2 else reason,
+                resolution=codes.MISSING_ADDRESS,
             ))
             continue
 
@@ -387,7 +526,12 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                 "longitude": confirmed.longitude,
                 "formatted_address": confirmed.formatted_address,
             }
+            if use_v2 and confirmed.pincode:
+                # The accepted preview's pincode, so the row isn't blank.
+                geocode_result["pincode"] = confirmed.pincode
             error_reason = None
+            resolution, source = _confirmed_classification(confirmed)
+            accepted_pin = geocode_result
             logger.info(
                 "Using executive-confirmed location for consignment %s (corrected=%s)",
                 consignment_id, confirmed.corrected,
@@ -408,6 +552,9 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                     lookup_address=receiver_address or None,
                     consignment_id=consignment_id,
                 ) or (geocode_result, None)
+                if geocode_result is not accepted_pin:
+                    # Reconcile swapped in a stronger (executive) memo pin.
+                    resolution = codes.KNOWN_GOOD
                 # Feed this spelling into geocode_cache too - same as the
                 # auto-geocode path already does (see _geocode's step 4 and
                 # _memo_hit) - so a confirmed/corrected save also teaches the
@@ -424,13 +571,21 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                         drs_memo_group=drs_memo.group_id(memo_drs_id, _memo_entry_id),
                     )
         else:
-            geocode_result, error_reason, _error_code, cache_outcome = _geocode(
-                geocode_address_str,
-                lookup_address=receiver_address or None,
-                drs_id=memo_drs_id,
-                match_info=match_info,
-                consignment_id=consignment_id,
-            )
+            geocode_result, error_reason, error_code, cache_outcome, resolution, source = \
+                _unpack_geocode(_geocode(
+                    geocode_address_str,
+                    lookup_address=receiver_address or None,
+                    drs_id=memo_drs_id,
+                    match_info=match_info,
+                    consignment_id=consignment_id,
+                    use_v2=use_v2,
+                    retry_address=(
+                        build_retry_address(receiver_address, _components_of(receiver))
+                        if use_v2 else None
+                    ),
+                ))
+            if geocode_result is None and not resolution:
+                resolution = codes.resolution_for_error(error_code)
             drs_metrics["cacheLookups"] += 1
             if cache_outcome == "exact_hit":
                 drs_metrics["exactHits"] += 1
@@ -446,17 +601,34 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
             if cache_outcome not in ("exact_hit", "fuzzy_hit", "drs_hit"):
                 drs_metrics["apiCalls"] += 1
         geocode_error = error_reason
-        geocode_status = "success" if geocode_result else "failed"
+        geocode_status = codes.status_for(geocode_result, resolution, use_v2)
 
         if geocode_result is None:
             drs_metrics["apiFailures"] += 1
             logger.warning("Geocoding failed for consignment %s: %s", consignment_id, geocode_error)
+            # failures[].reason keeps today's strings (3PL save-result handling);
+            # only the routing row's geocode_error switches to the standard text.
             failures.append({"consignmentId": consignment_id, "reason": geocode_error})
             rows_to_merge.append(_failed_row(
                 drs_no, drs_id, driver_numeric_id, consignment_id,
-                receiver_address, receiver_name, geocode_address_str, geocode_error,
+                receiver_address, receiver_name, geocode_address_str,
+                codes.message_for(resolution) if use_v2 else geocode_error,
+                resolution=resolution,
             ))
             continue
+
+        exception_flag = derive_exception_flag(geocode_result)
+        if use_v2:
+            if resolution == codes.PINCODE_MISMATCH:
+                exception_flag = "PINCODE_MISMATCH"
+            geocode_error = (
+                codes.message_for(
+                    resolution,
+                    found=geocode_result.get("pincode"),
+                    given=extract_pincode(geocode_address_str) or match_info.get("pincode"),
+                )
+                if geocode_status == codes.STATUS_NEEDS_REVIEW else None
+            )
 
         geohash_exact = pgh.encode(
             geocode_result["latitude"], geocode_result["longitude"], precision=8
@@ -468,7 +640,7 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
             geocode_result["latitude"], geocode_result["longitude"],
             geocode_result.get("locality"), geocode_result.get("area"),
             geohash_exact, geocode_result.get("pincode"),
-            derive_exception_flag(geocode_result),
+            exception_flag,
             derive_is_commercial(geocode_result),
             formatted_address=geocode_result.get("formatted_address"),
             place_id=geocode_result.get("place_id"),
@@ -488,6 +660,8 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
             # — ignored by the MERGE on every subsequent save.
             planned_latitude=geocode_result["latitude"],
             planned_longitude=geocode_result["longitude"],
+            geocode_resolution=resolution,
+            geocode_source=source,
         ))
         saved_count += 1
 

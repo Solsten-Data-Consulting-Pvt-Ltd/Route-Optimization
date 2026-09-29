@@ -23,6 +23,14 @@ DRS_MEMO_FUZZY_THRESHOLD = 90
 DRS_MEMO_CONTAINMENT_RATIO = 0.9
 DRS_MEMO_MIN_CONTAINED_TOKENS = 5
 
+# Feature flags: the 3PL featureFlags collection (same Firestore project).
+FEATURE_FLAGS_COLLECTION = "featureFlags"
+FEATURE_FLAG_TTL_SECONDS = int(os.environ.get("FEATURE_FLAG_TTL_SECONDS", "45"))
+
+# Address resolution: Places candidates closer than this count as one place.
+PLACES_CANDIDATE_PAGE_SIZE = 5
+SAME_PLACE_SPREAD_M = 300
+
 GEOHASH_LOCALITY_LEN = 5
 GEOHASH_BUILDING_LEN = 6
 MAX_ROWS_PER_MERGE = 500
