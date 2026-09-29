@@ -38,3 +38,14 @@ def _install_offline_flags():
 
 
 _install_offline_flags()
+
+
+def _install_offline_candidates():
+    # set_routing_candidates writes straight to Firestore after a save; tests
+    # that care patch app.services.save.set_routing_candidates themselves.
+    from app.services import save
+
+    save.set_routing_candidates = lambda *_a, **_k: 0
+
+
+_install_offline_candidates()

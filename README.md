@@ -202,6 +202,15 @@ ALTER TABLE `<project>.Hermes_Exports.consignments_routing`
 
 The MERGE writes both columns, so a deploy without them fails every save.
 
+**Candidates for doubtful pins (Firestore only, no schema change):** with the
+flag on, a `MULTI_CANDIDATE` / `PINCODE_MISMATCH` pin also gets
+`consignments_routing.geocode_candidates` — up to 5 places Google offered
+(`name`, `formatted_address`, `latitude`, `longitude`, `pincode`, `place_id`,
+`in_pincode`). The preview returns the same list as `candidates`, and 3PL
+sends it back in `confirmedLocations[id].candidates` with an accepted pin, so
+the admin review screen shows exactly what was compared. Any other resolution
+(including an admin fix) writes `null`, clearing the list.
+
 **Rollout:** ALTER TABLE (dev) → deploy with the flag off and count rows by
 `geocode_resolution` for 2–3 days → deploy the 3PL side → flag on in dev,
 then prod. Turning the flag off takes effect within 45 s, no redeploy.

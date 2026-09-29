@@ -191,6 +191,31 @@ def upsert_consignments_routing(rows):
     return _commit_in_batches(rows, _save_routing_doc)
 
 
+def set_routing_candidates(candidates_by_consignment):
+    """Firestore-only `geocode_candidates` on each just-saved routing doc:
+    the places Google offered for a doubtful pin (MULTI_CANDIDATE /
+    PINCODE_MISMATCH), or None to clear an old list once the pin is no
+    longer doubtful. Not a BigQuery column — it's review context for the
+    admin screen, not routing data. Merge writes, same docs
+    upsert_consignments_routing just wrote; the sort pipeline never
+    touches it (not in _base_routing_doc)."""
+    if not candidates_by_consignment:
+        return 0
+    fs_client = get_fs_client()
+    batch = fs_client.batch()
+    count = 0
+    for consignment_id, candidates in candidates_by_consignment.items():
+        doc_ref = fs_client.collection(ROUTING_COLLECTION).document(consignment_id)
+        batch.set(doc_ref, {"geocode_candidates": candidates or None}, merge=True)
+        count += 1
+        if count % FIRESTORE_BATCH_SIZE == 0:
+            batch.commit()
+            batch = fs_client.batch()
+    if count % FIRESTORE_BATCH_SIZE != 0:
+        batch.commit()
+    return count
+
+
 def upsert_routing_from_sorting(rows):
     """Post-sorting sync: sequencing/grouping fields only. Leaves the geocode
     provenance fields AND the location/override fields (latitude, longitude,

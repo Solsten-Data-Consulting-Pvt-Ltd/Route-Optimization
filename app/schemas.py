@@ -29,6 +29,9 @@ class ConfirmedLocation(BaseModel):
     resolution: Optional[str] = None   # from the preview the executive accepted
     source: Optional[str] = None       # "preview" | "confirmed" | "admin" (admin fix)
     pincode: Optional[str] = None      # the preview's pincode, so the row isn't blank
+    # The places the preview compared (only sent for a doubtful pin), so
+    # admin reviews exactly what the executive was offered.
+    candidates: Optional[List[Dict[str, Any]]] = None
 
     @model_validator(mode="after")
     def _require_overridden_by_when_corrected(self):

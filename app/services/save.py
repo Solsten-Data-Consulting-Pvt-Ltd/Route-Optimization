@@ -13,7 +13,11 @@ from app.db.bigquery import (
     merge_routing_rows,
 )
 from app.db.cache_metrics import write_drs_cache_metrics
-from app.db.firestore import get_consignments_by_id, upsert_consignments_routing
+from app.db.firestore import (
+    get_consignments_by_id,
+    set_routing_candidates,
+    upsert_consignments_routing,
+)
 from app.db import drs_memo, feature_flags
 from app.db.geocache import get_cached_geocode_with_outcome, save_to_cache
 from app.services import geocode_codes as codes
@@ -377,6 +381,11 @@ def preview_geocode(receiver_name, receiver_address, drs_id=None, consignment_id
         "resolution": resolution or codes.CONFIDENT,
         "source": source,
         "pincode": geocode_result.get("pincode"),
+        # The places Google offered, only for a doubtful pin — 3PL sends
+        # them back with the accepted pin so admin reviews the same set.
+        "candidates": _review_candidates(
+            use_v2, resolution, geocode_result.get("candidates"),
+        ) or [],
     }
 
 
@@ -416,6 +425,35 @@ def _confirmed_classification(confirmed):
     if sent in codes.RESOLUTIONS and sent not in codes.FAILED_RESOLUTIONS:
         return sent, source
     return codes.CONFIDENT, source
+
+
+_CANDIDATE_TEXT_FIELDS = ("name", "formatted_address", "pincode", "place_id")
+
+
+def _clean_candidates(candidates):
+    """Candidates sent back by 3PL with an accepted preview pin: at most 5,
+    numeric coordinates, short strings only. Anything malformed is dropped."""
+    cleaned = []
+    for c in (candidates or [])[:5]:
+        if not isinstance(c, dict):
+            continue
+        lat, lng = c.get("latitude"), c.get("longitude")
+        if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+            continue
+        item = {"latitude": float(lat), "longitude": float(lng),
+                "in_pincode": bool(c.get("in_pincode"))}
+        for key in _CANDIDATE_TEXT_FIELDS:
+            value = c.get(key)
+            item[key] = str(value)[:300] if isinstance(value, (str, int)) and str(value) else None
+        cleaned.append(item)
+    return cleaned or None
+
+
+def _review_candidates(use_v2, resolution, candidates):
+    """Only doubtful pins keep a candidate list; anything else clears it."""
+    if use_v2 and resolution in codes.REVIEW_RESOLUTIONS and candidates:
+        return candidates
+    return None
 
 
 def _dedupe(consignment_ids):
@@ -471,6 +509,9 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
     docs, not_found_ids = get_consignments_by_id(deduped_ids)
 
     rows_to_merge = []
+    # consignmentId -> places Google offered for a doubtful pin (or None to
+    # clear). Written to Firestore after the routing upsert below.
+    candidates_by_cid = {}
     cache_metrics_by_drs = {}
     failures = [
         {"consignmentId": cid, "reason": "Consignment not found."}
@@ -509,6 +550,7 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                 codes.message_for(codes.MISSING_ADDRESS) if use_v2 else reason,
                 resolution=codes.MISSING_ADDRESS,
             ))
+            candidates_by_cid[consignment_id] = None
             continue
 
         confirmed = (confirmed_locations or {}).get(consignment_id)
@@ -600,6 +642,15 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
 
             if cache_outcome not in ("exact_hit", "fuzzy_hit", "drs_hit"):
                 drs_metrics["apiCalls"] += 1
+        # Places Google offered for this pin: from the accepted preview
+        # (confirmed, not moved) or from this save's own Places call. Kept
+        # only for a doubtful pin; a corrected/verified pin clears the list.
+        if confirmed:
+            row_candidates = None if confirmed.corrected else _clean_candidates(confirmed.candidates)
+        else:
+            row_candidates = (geocode_result or {}).get("candidates")
+        candidates_by_cid[consignment_id] = _review_candidates(use_v2, resolution, row_candidates)
+
         geocode_error = error_reason
         geocode_status = codes.status_for(geocode_result, resolution, use_v2)
 
@@ -683,6 +734,14 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
             logger.exception("Failed to deactivate stale routing rows")
         bq_rows = fetch_rows_by_consignment_drs_pairs(saved_pairs)
         upsert_consignments_routing(bq_rows)
+        try:
+            saved_ids = {cid for cid, _drs in saved_pairs}
+            set_routing_candidates(
+                {cid: c for cid, c in candidates_by_cid.items() if cid in saved_ids}
+            )
+        except Exception:
+            # Review context only — never fail a save that already succeeded.
+            logger.exception("Failed to store geocode candidates")
 
     try:
         write_drs_cache_metrics(cache_metrics_by_drs, start_dt)

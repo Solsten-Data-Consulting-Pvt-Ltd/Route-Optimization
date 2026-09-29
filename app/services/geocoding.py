@@ -224,8 +224,41 @@ def classify_places(places, address_pincode, use_v2):
     return in_area[0], MULTI_CANDIDATE
 
 
+MAX_STORED_CANDIDATES = 5
+
+
+def _candidate_summary(place, address_pincode):
+    """Compact, storable view of one Places candidate (what admin is shown)."""
+    location = place.get("location") or {}
+    pincode = _place_pincode(place)
+    return {
+        "name": (place.get("displayName") or {}).get("text"),
+        "formatted_address": place.get("formattedAddress"),
+        "latitude": location.get("latitude"),
+        "longitude": location.get("longitude"),
+        "pincode": pincode,
+        "place_id": place.get("id"),
+        "in_pincode": bool(address_pincode and pincode == address_pincode),
+    }
+
+
+def _candidate_summaries(places, address_pincode):
+    return [
+        _candidate_summary(p, address_pincode)
+        for p in places[:MAX_STORED_CANDIDATES]
+        if (p.get("location") or {}).get("latitude") is not None
+        and (p.get("location") or {}).get("longitude") is not None
+    ]
+
+
 def _search_and_classify(query, address_pincode, use_v2, max_retries):
-    """(result, error_reason, error_code, resolution) for one Places query."""
+    """(result, error_reason, error_code, resolution) for one Places query.
+
+    With use_v2, the returned result also carries `candidates`: every
+    located place Google offered for this query (the set classify_places
+    chose from). It's never cached — geocache/drs_memo copy only
+    CACHED_RESULT_FIELDS — and is only stored on the routing doc for
+    doubtful pins (save.py)."""
     places, error_reason, error_code = _search_places(
         query, max_retries, page_size=PLACES_CANDIDATE_PAGE_SIZE if use_v2 else None,
     )
@@ -250,7 +283,10 @@ def _search_and_classify(query, address_pincode, use_v2, max_retries):
             ZERO_RESULTS,
         )
 
-    return _build_result(place, query, address_pincode), None, None, resolution
+    result = _build_result(place, query, address_pincode)
+    if use_v2:
+        result["candidates"] = _candidate_summaries(places, address_pincode)
+    return result, None, None, resolution
 
 
 def places_search_classified(address: str, use_v2: bool = False,
