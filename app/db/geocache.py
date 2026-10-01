@@ -296,11 +296,23 @@ def get_cached_geocode(
 
 
 def _docs_by_group(drs_memo_group: str):
-    """Every geocode_cache doc already tagged with this drs_memo_group -
-    normally 0 (first spelling of a new place) or 1 (every later spelling
-    of a place the DRS memo already resolved earlier today reuses that same
-    doc instead of writing its own)."""
-    return list(_collection().where("drs_memo_group", "==", drs_memo_group).stream())
+    """Every geocode_cache doc tagged with this drs_memo_group - normally 0
+    (first spelling of a new place) or 1 (every later spelling of a place the
+    DRS memo already resolved earlier today reuses that same doc instead of
+    writing its own).
+
+    A doc has ONE creating group (scalar `drs_memo_group`) plus every group
+    that has since written to it (`drs_memo_groups`). Two memo groups can
+    normalise to the same cache key (e.g. "Unit 17A, 18/2A ..." and "Unit 17
+    ..." both end up as "ambalipura sarjapura road ..."); the later group must
+    not steal the doc's tag, or verifying the earlier group would verify
+    nothing. Docs written before `drs_memo_groups` existed only have the
+    scalar, which is still queried.
+    """
+    docs = {d.id: d for d in _collection().where("drs_memo_group", "==", drs_memo_group).stream()}
+    for d in _collection().where("drs_memo_groups", "array_contains", drs_memo_group).stream():
+        docs.setdefault(d.id, d)
+    return list(docs.values())
 
 
 def save_to_cache(
@@ -341,9 +353,12 @@ def save_to_cache(
         "source": source,
         "updated_at": firestore.SERVER_TIMESTAMP,
     })
+    # The group tag is NOT part of `payload`: an existing doc keeps its creating
+    # group and only gains this one in `drs_memo_groups` (see _docs_by_group).
+    group_update = (
+        {"drs_memo_groups": firestore.ArrayUnion([drs_memo_group])} if drs_memo_group else {}
+    )
     if drs_memo_group:
-        payload["drs_memo_group"] = drs_memo_group
-
         # Reuse a sibling entry the DRS memo already tagged with this same
         # group (see drs_memo.py & address_match.py::drs_match - it can
         # match two spellings that don't even look similar as text, e.g. via
@@ -371,6 +386,7 @@ def save_to_cache(
             }
             siblings[0].reference.update({
                 **sibling_payload,
+                **group_update,
                 "address_normalized_variants": firestore.ArrayUnion([normalized]),
             })
             return
@@ -379,7 +395,7 @@ def save_to_cache(
     # An existing entry keeps its ops verdict and hit count; only the geocode
     # payload is refreshed.
     if doc_ref.get().exists:
-        doc_ref.update(payload)
+        doc_ref.update({**payload, **group_update})
         return
 
     # This exact spelling has no doc of its own - but it may already be a
@@ -401,11 +417,13 @@ def save_to_cache(
             k: v for k, v in payload.items()
             if k not in ("address_normalized", "address_raw", "geocode_address_raw")
         }
-        variant_matches[0].reference.update(sibling_payload)
+        variant_matches[0].reference.update({**sibling_payload, **group_update})
         return
 
     doc_ref.set({
         **payload,
+        **({"drs_memo_group": drs_memo_group, "drs_memo_groups": [drs_memo_group]}
+           if drs_memo_group else {}),
         "address_normalized_variants": [normalized],
         "verified": False,
         "verified_by": None,
@@ -424,9 +442,7 @@ def verify_cache_group(drs_memo_group: str, verified_by: str) -> int:
     """
     if not drs_memo_group:
         return 0
-    docs = list(
-        _collection().where("drs_memo_group", "==", drs_memo_group).stream()
-    )
+    docs = _docs_by_group(drs_memo_group)
     if not docs:
         return 0
     batch = get_fs_client().batch()
