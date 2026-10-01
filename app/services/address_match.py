@@ -22,7 +22,8 @@ Rules, in order (see `drs_match`):
      (no door number, < 3 distinctive words)   "Kodathi Village Main Road,
                                                Kodathi Gate, Bangalore ..."
                                                is shared by the whole road).
-  4. Door numbers must be identical, then   -> exact key, or one address's
+  4. Door numbers must be identical         -> (a trailing unit letter is
+     ignored: "17A" == "17"), then            exact key, or one address's
                                                words contained in the other's,
                                                or token_sort_ratio >= cutoff.
 """
@@ -52,9 +53,12 @@ CITY_VARIANTS = {
     "banglore": "bengaluru",
     "bengalore": "bengaluru",
     "bangaluru": "bengaluru",
+    "benglore": "bengaluru",
     "blr": "bengaluru",
     "sarjapur": "sarjapura",
     "amblipura": "ambalipura",
+    "ambaipura": "ambalipura",
+    "belandur": "bellandur",
 }
 
 # Spelling fixes and filler words ("" = drop the token).
@@ -104,6 +108,20 @@ def door_numbers(key: str) -> set:
         t for t in key.split()
         if DOOR_NUMBER_RE.fullmatch(t) and not ORDINAL_RE.fullmatch(t)
     }
+
+
+def loose_key(key: str) -> str:
+    """`key` with the trailing letter of door numbers dropped ('17a' -> '17',
+    '18/2a' -> '18/2'). OCR/handwriting often adds or drops a unit suffix for
+    the same building ("Unit 17A" vs "Unit 17"), so same-place decisions use
+    this form. Ordinals ('2nd') and ordinary words are untouched."""
+    out = []
+    for token in key.split():
+        if DOOR_NUMBER_RE.fullmatch(token) and not ORDINAL_RE.fullmatch(token):
+            token = token.rstrip("abcdefghijklmnopqrstuvwxyz")
+        if token and token not in out:
+            out.append(token)
+    return " ".join(out)
 
 
 def is_precise(key: str, locality_words: Iterable[str] = ()) -> bool:
@@ -204,6 +222,10 @@ def drs_match(new: dict, entry: dict) -> Optional[str]:
     if pa and pb and pa != pb:
         return None
 
+    # Compare door numbers and text without unit-suffix letters, so "17A" and
+    # "17" (same building, differently written) are the same place. 12 vs 13
+    # or 31 vs 32 still differ.
+    a_key, b_key = loose_key(a_key), loose_key(b_key)
     na, nb = door_numbers(a_key), door_numbers(b_key)
 
     if set(new.get("phones") or ()) & set(entry.get("phones") or ()):

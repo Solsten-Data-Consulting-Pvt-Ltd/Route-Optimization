@@ -159,6 +159,32 @@ class DrsMatchTests(unittest.TestCase):
         other["addressComponent"]["postal_code"] = "560037"
         self.assertNoMatch(LIKHITHA_1, other)
 
+    # --- Shahi Exports / AKR, Ambalipura DRS (dev, 2026-10-01) ---------------
+    # Same building written "Unit-17A" and "Unit 17": was split into two memo
+    # groups (and two geocode_cache docs) because the door numbers differed.
+    def test_unit_suffix_letter_is_same_building(self):
+        a = receiver("Unit-17A, 18/2A, AKR, Sarjapur Road, Bellandur Gate, Ambalipura, "
+                     "Bengaluru, Karnataka 560102, India", "AKR, Ambalipura, Sarjapur Road",
+                     "9025509592")
+        b = receiver("Unit -17 AKR, #18/2A, Sarjapur Road, Bellandur Gate, Ambaipura, "
+                     "Bangalore, 560102, India", "Ambaipura, Sarjapur Road", "9901913551")
+        self.assertMatch(a, b)
+
+    def test_different_unit_number_still_differs(self):
+        a = receiver("Unit 17, 18/2A, AKR, Sarjapur Road, Bellandur Gate, Ambalipura, "
+                     "Bengaluru 560102", "x", None)
+        b = receiver("Unit 18, 18/2A, AKR, Sarjapur Road, Bellandur Gate, Ambalipura, "
+                     "Bengaluru 560102", "x", None)
+        self.assertNoMatch(a, b)
+
+    def test_ocr_spelling_variants_normalise(self):
+        self.assertEqual(match_key("Ambaipura Belandur Benglore"),
+                         match_key("Ambalipura Bellandur Bengaluru"))
+
+    def test_door_suffix_loose_key_leaves_ordinals_alone(self):
+        from app.services.address_match import loose_key
+        self.assertEqual(loose_key("17a 18/2a 2nd 140/1"), "17 18/2 2nd 140/1")
+
     def test_same_phone_different_door_numbers(self):
         home = receiver("No 12, 3rd Cross, Kodathi Village, Bangalore 560035", LIKHITHA_OCR,
                         "8792767027")

@@ -83,6 +83,9 @@ CITY_VARIANTS = {
     "bangalore": "bengaluru",
     "sarjapur": "sarjapura",
     "amblipura": "ambalipura",
+    "ambaipura": "ambalipura",   # OCR drops the 'l'
+    "benglore": "bengaluru",
+    "belandur": "bellandur",
     # Expand this from real spelling variants found in your own address data
     # (the ~30% address-repeat-rate finding is the right source to mine this from).
 }

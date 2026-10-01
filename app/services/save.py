@@ -163,7 +163,7 @@ _MEMO_KNOWN_GOOD_SOURCES = {
 
 
 def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignment_id,
-              corrected_tier=False):
+              corrected_tier=False, match_info=None):
     result = drs_memo.result_from_entry(entry, address)
     if corrected_tier:
         classification = (codes.KNOWN_GOOD, codes.SOURCE_MEMO_CORRECTED)
@@ -174,7 +174,8 @@ def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignm
     logger.info("DRS memo hit (%s, source=%s) drs=%s for '%s'",
                 reason, entry.get("source"), drs_id, address[:80])
     _safe(drs_memo.link, drs_id, entry_id,
-          lookup_address=lookup_address, consignment_id=consignment_id)
+          lookup_address=lookup_address, consignment_id=consignment_id,
+          phones=(match_info or {}).get("phones"))
     # A new spelling of this place: give it its own (unverified) geocode_cache
     # entry in the same group, so verifying the group at end of DRS makes
     # this spelling servable from the global cache tomorrow.
@@ -229,7 +230,7 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
                                   sources={drs_memo.SOURCE_EXEC_CORRECTED})
         if hit:
             return _memo_hit(drs_id, *hit, address, lookup_address, consignment_id,
-                             corrected_tier=True)
+                             corrected_tier=True, match_info=match_info)
 
     # 2. Verified global cache.
     try:
@@ -257,7 +258,8 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
     if use_memo:
         hit = drs_memo.find_match(memo_entries, match_info)
         if hit:
-            return _memo_hit(drs_id, *hit, address, lookup_address, consignment_id)
+            return _memo_hit(drs_id, *hit, address, lookup_address, consignment_id,
+                             match_info=match_info)
 
     # 4. Places. Flag off -> exactly today's call and pick.
     if use_v2:

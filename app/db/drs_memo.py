@@ -146,9 +146,18 @@ def remember(drs_id, info: dict, result: dict, source: str, *,
     return entry_id
 
 
-def link(drs_id, entry_id, *, lookup_address=None, consignment_id=None) -> None:
-    """Record that another consignment reused this entry's pin."""
+def link(drs_id, entry_id, *, lookup_address=None, consignment_id=None, phones=None) -> None:
+    """Record that another consignment reused this entry's pin.
+
+    `phones` (the new consignment's receiver phones) are added to the entry's
+    match phones. Without this an entry only ever knew the FIRST consignment's
+    phone, so a later consignment sharing a phone with a later member of the
+    group could not be linked to it by the phone rule.
+    """
     update = {}
+    phones = [p for p in (phones or []) if p]
+    if phones:
+        update["match"] = {"phones": firestore.ArrayUnion(phones)}
     if lookup_address:
         update["variants"] = firestore.ArrayUnion([lookup_address])
     if consignment_id:
@@ -200,7 +209,8 @@ def reconcile(drs_id, info: dict, result: dict, source: str, *,
         if _SOURCE_PRIORITY.get(entry.get("source"), 0) >= _SOURCE_PRIORITY.get(source, 0):
             # Existing entry is at least as trustworthy - reuse its pin
             # instead of drifting off on this consignment's own point.
-            link(drs_id, match_id, lookup_address=lookup_address, consignment_id=consignment_id)
+            link(drs_id, match_id, lookup_address=lookup_address, consignment_id=consignment_id,
+                 phones=(info or {}).get("phones"))
             return result_from_entry(entry, lookup_address or ""), match_id
         # This source outranks the match - upgrade that SAME entry in
         # place (not a new one keyed on this address's own hash).
