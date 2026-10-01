@@ -181,6 +181,21 @@ class DrsMatchTests(unittest.TestCase):
         self.assertEqual(match_key("Ambaipura Belandur Benglore"),
                          match_key("Ambalipura Bellandur Bengaluru"))
 
+    def test_same_phone_missing_unit_number_is_same_building(self):
+        # "Unit 17" (no 18/2A) vs "Unit 17, 18/2A", same phone: was split.
+        full = receiver("Unit 17, 18/2A, Sarjapur Road, Bellandur Gate, Ambalipura, Bangalore, "
+                        "Karnataka 560102, India", "x", "9515505560")
+        part = receiver("Unit 17, Sarjapur Road, Bellandur Gate, Ambalipura, Bangalore, "
+                        "Karnataka 560102, India", "x", "9515505560")
+        self.assertMatch(full, part, "phone")
+
+    def test_missing_unit_number_without_shared_phone_still_differs(self):
+        full = receiver("Unit 17, 18/2A, Sarjapur Road, Bellandur Gate, Ambalipura, Bangalore, "
+                        "Karnataka 560102, India", "x", "9515505560")
+        part = receiver("Unit 17, Sarjapur Road, Bellandur Gate, Ambalipura, Bangalore, "
+                        "Karnataka 560102, India", "x", "8074003657")
+        self.assertNoMatch(full, part)
+
     def test_door_suffix_loose_key_leaves_ordinals_alone(self):
         from app.services.address_match import loose_key
         self.assertEqual(loose_key("17a 18/2a 2nd 140/1"), "17 18/2 2nd 140/1")

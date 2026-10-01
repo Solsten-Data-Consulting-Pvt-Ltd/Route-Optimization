@@ -17,7 +17,9 @@ Rules, in order (see `drs_match`):
   1. Different pincode                      -> never the same place.
   2. Same receiver phone                    -> same place, unless both
                                                addresses carry door numbers
-                                               and they differ.
+                                               and they conflict (one set
+                                               being a subset of the other is
+                                               not a conflict).
   3. Either address is road-level           -> no text match (e.g. OCR text
      (no door number, < 3 distinctive words)   "Kodathi Village Main Road,
                                                Kodathi Gate, Bangalore ..."
@@ -229,7 +231,11 @@ def drs_match(new: dict, entry: dict) -> Optional[str]:
     na, nb = door_numbers(a_key), door_numbers(b_key)
 
     if set(new.get("phones") or ()) & set(entry.get("phones") or ()):
-        if na and nb and na != nb:
+        # Same phone: same place, unless the door numbers conflict (shop vs
+        # home). One address merely missing a number the other has ("Unit 17"
+        # vs "Unit 17, 18/2A") is not a conflict - the same person at the same
+        # building, written with fewer details.
+        if na and nb and not (na <= nb or nb <= na):
             return None          # same person, different building (shop vs home)
         return "phone"
 
