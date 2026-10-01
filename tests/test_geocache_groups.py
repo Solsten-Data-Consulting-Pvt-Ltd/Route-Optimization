@@ -149,6 +149,20 @@ class GroupTagTests(unittest.TestCase):
         self.assertEqual(len(geocache._docs_by_group(GROUP_A)), 1)
         self.assertEqual(geocache.verify_cache_group(GROUP_A, "ops"), 1)
 
+    def test_verify_commits_in_chunks_for_large_groups(self):
+        for i in range(1100):
+            self.col.docs[f"d{i}"] = {"drs_memo_group": GROUP_A, "verified": False}
+        commits = []
+        real_commit = FakeBatch.commit
+        FakeBatch.commit = lambda self_: (commits.append(len(self_.ops)), real_commit(self_))
+        try:
+            self.assertEqual(geocache.verify_cache_group(GROUP_A, "ops"), 1100)
+        finally:
+            FakeBatch.commit = real_commit
+        self.assertTrue(all(n <= 500 for n in commits))
+        self.assertEqual(sum(commits), 1100)
+        self.assertTrue(all(d["verified"] for d in self.col.docs.values()))
+
 
 if __name__ == "__main__":
     unittest.main()

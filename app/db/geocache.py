@@ -78,6 +78,7 @@ from app.db.clients import get_fs_client
 logger = logging.getLogger(__name__)
 
 GEOCODE_CACHE_COLLECTION = "geocode_cache"
+VERIFY_BATCH_SIZE = 450   # Firestore batches cap at 500 writes
 
 CITY_VARIANTS = {
     "bangalore": "bengaluru",
@@ -445,13 +446,16 @@ def verify_cache_group(drs_memo_group: str, verified_by: str) -> int:
     docs = _docs_by_group(drs_memo_group)
     if not docs:
         return 0
-    batch = get_fs_client().batch()
-    for doc in docs:
-        batch.update(doc.reference, {
-            "verified": True,
-            "verified_by": verified_by,
-            "verified_at": firestore.SERVER_TIMESTAMP,
-        })
-    batch.commit()
+    # A Firestore batch holds at most 500 writes; a large DRS (500+ places in
+    # one group chain) must be committed in chunks or the whole verify fails.
+    for start in range(0, len(docs), VERIFY_BATCH_SIZE):
+        batch = get_fs_client().batch()
+        for doc in docs[start:start + VERIFY_BATCH_SIZE]:
+            batch.update(doc.reference, {
+                "verified": True,
+                "verified_by": verified_by,
+                "verified_at": firestore.SERVER_TIMESTAMP,
+            })
+        batch.commit()
     invalidate_snapshot()
     return len(docs)

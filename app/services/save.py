@@ -179,7 +179,11 @@ def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignm
     # A new spelling of this place: give it its own (unverified) geocode_cache
     # entry in the same group, so verifying the group at end of DRS makes
     # this spelling servable from the global cache tomorrow.
-    if lookup_address and lookup_address not in (entry.get("variants") or []):
+    # Not for an entry that came straight from the verified cache: that place
+    # already has a verified doc, and a second unverified doc for a mere
+    # re-spelling of it is just a duplicate.
+    if (lookup_address and lookup_address not in (entry.get("variants") or [])
+            and entry.get("source") != drs_memo.SOURCE_GLOBAL_CACHE):
         _safe(save_to_cache, address, result, lookup_address=lookup_address,
               source="drs_memo", drs_memo_group=drs_memo.group_id(drs_id, entry_id))
     return result, None, None, "drs_hit", classification
@@ -245,9 +249,20 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
     if cached:
         logger.info("Geocode cache hit for '%s'", address[:80])
         if use_memo:
-            _safe(drs_memo.remember, drs_id, match_info, cached, drs_memo.SOURCE_GLOBAL_CACHE,
-                  lookup_address=lookup_address, consignment_id=consignment_id,
-                  entries=memo_entries)
+            # Same place already in this DRS's memo under another spelling
+            # (e.g. "Unit 17" vs "Unit -17 AKR, #18/2A")? Join that entry
+            # instead of opening a second memo group for one place. The
+            # served pin stays the verified cache pin.
+            memo_hit = drs_memo.find_match(memo_entries, match_info)
+            if memo_hit:
+                _safe(drs_memo.link, drs_id, memo_hit[0],
+                      lookup_address=lookup_address, consignment_id=consignment_id,
+                      phones=(match_info or {}).get("phones"))
+            else:
+                _safe(drs_memo.remember, drs_id, match_info, cached,
+                      drs_memo.SOURCE_GLOBAL_CACHE,
+                      lookup_address=lookup_address, consignment_id=consignment_id,
+                      entries=memo_entries)
         source = (codes.SOURCE_CACHE_EXACT if cache_outcome == "exact_hit"
                   else codes.SOURCE_CACHE_FUZZY)
         return cached, None, None, cache_outcome, (

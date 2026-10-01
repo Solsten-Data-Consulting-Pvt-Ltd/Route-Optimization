@@ -354,6 +354,26 @@ class GeocodeOrderTests(unittest.TestCase):
         self.assertEqual(kwargs["source"], "drs_memo")
         self.assertTrue(kwargs["drs_memo_group"].startswith("DRS-KODATHI:"))
 
+    # --- verified-cache hits must not fragment the DRS memo ------------------
+    def test_cache_hit_joins_existing_same_place_memo_entry(self):
+        verified = {"latitude": 1.0, "longitude": 2.0, "types": []}
+        self._geocode(KUMMARY_1, "C1", cache=(verified, "exact_hit"))
+        (_r, _, _, outcome, _cls), calls = self._geocode(
+            KUMMARY_3, "C2", cache=(verified, "fuzzy_hit"))
+        entries = self.store.docs["DRS-KODATHI"]["entries"]
+        self.assertEqual((outcome, calls), ("fuzzy_hit", 0))
+        self.assertEqual(len(entries), 1)                       # one place, one entry
+        self.assertEqual(next(iter(entries.values()))["consignment_ids"], ["C1", "C2"])
+
+    def test_new_spelling_of_cache_backed_place_adds_no_duplicate_cache_doc(self):
+        verified = {"latitude": 1.0, "longitude": 2.0, "types": []}
+        self._geocode(KUMMARY_1, "C1", cache=(verified, "exact_hit"))
+        save_mod.save_to_cache.reset_mock()
+        variant = dict(KUMMARY_3, address="Kodathi, " + KUMMARY_OCR)
+        (_r, _, _, outcome, _cls), _ = self._geocode(variant, "C2")   # cache miss -> memo
+        self.assertEqual(outcome, "drs_hit")
+        save_mod.save_to_cache.assert_not_called()
+
 
 class PipelineScenarioTests(unittest.TestCase):
     """The five real parcels saved in scan order through the full pipeline."""
