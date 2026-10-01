@@ -26,6 +26,12 @@ class CompanySpellingTests(unittest.TestCase):
         self.assertNotEqual(match_key("Alpha Exports Pvt Ltd, Unit 17"),
                             match_key("Beta Exports Pvt Ltd, Unit 17"))
 
+    def test_ocr_locality_misspellings(self):
+        self.assertEqual(normalize_address("Ilandur, Kasarjpura Road"),
+                         "bellandur sarjapura road")
+        self.assertEqual(match_key("Ilandur Kasarjpura Road"),
+                         match_key("Bellandur Sarjapura Road"))
+
 
 if __name__ == "__main__":
     unittest.main()

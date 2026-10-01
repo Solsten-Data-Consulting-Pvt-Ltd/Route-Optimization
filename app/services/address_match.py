@@ -61,6 +61,8 @@ CITY_VARIANTS = {
     "amblipura": "ambalipura",
     "ambaipura": "ambalipura",
     "belandur": "bellandur",
+    "ilandur": "bellandur",
+    "kasarjpura": "sarjapura",
 }
 
 # Spelling fixes and filler words ("" = drop the token).
