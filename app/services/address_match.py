@@ -86,6 +86,7 @@ BUSINESS_WORD_VARIANTS = {
     "exports": "export", "imports": "import", "enterprises": "enterprise",
     "industries": "industry", "traders": "trader", "company": "co",
 }
+SLASH_SPACE_RE = re.compile(r"(?<=[0-9a-z])\s*/\s*(?=[0-9a-z])")
 BRACKET_P_RE = re.compile(r"[\[(]\s*p\s*[\])]")
 
 # Words that say nothing about WHICH building on a road.
@@ -104,6 +105,7 @@ def match_key(address: str) -> str:
     s = address.lower()
     s = MOBILE_IN_TEXT_RE.sub(" ", s)
     s = PINCODE_RE.sub(" ", s)
+    s = SLASH_SPACE_RE.sub("/", s)       # "18 / 2A" == "18/2A"
     s = BRACKET_P_RE.sub(" pvt ", s)     # "Export [P] Ltd" == "Export Pvt Ltd"
     s = re.sub(r"[^a-z0-9/]+", " ", s)
     out = []

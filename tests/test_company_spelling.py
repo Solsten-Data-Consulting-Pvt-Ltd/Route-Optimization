@@ -32,6 +32,10 @@ class CompanySpellingTests(unittest.TestCase):
         self.assertEqual(match_key("Ilandur Kasarjpura Road"),
                          match_key("Bellandur Sarjapura Road"))
 
+    def test_spaced_slash_door_number(self):
+        self.assertEqual(normalize_address("AKR 18 / 2A, Road"), normalize_address("AKR 18/2A, Road"))
+        self.assertEqual(match_key("AKR 18 / 2A Road"), match_key("AKR 18/2A Road"))
+
 
 if __name__ == "__main__":
     unittest.main()

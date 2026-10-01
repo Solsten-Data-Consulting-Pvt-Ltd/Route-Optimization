@@ -149,6 +149,9 @@ COMPANY_VARIANTS = (
 )
 
 
+SLASH_SPACE_RE = re.compile(r"(?<=[0-9a-z])\s*/\s*(?=[0-9a-z])")
+
+
 def normalize_address(address: str) -> str:
     if not address:
         return ""
@@ -156,6 +159,7 @@ def normalize_address(address: str) -> str:
     s = re.sub(r"[,\s]+", " ", s)
     s = PINCODE_RE.sub("", s)      # strip any 6-digit pincode, not just 560xxx
     s = PLUS_CODE_RE.sub("", s)    # Fix 2: strip Google Plus Codes
+    s = SLASH_SPACE_RE.sub("/", s)     # "18 / 2a" == "18/2a"
     for pattern, canonical in COMPANY_VARIANTS:
         s = pattern.sub(canonical, s)
     for variant, canonical in CITY_VARIANTS.items():
