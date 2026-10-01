@@ -7,8 +7,8 @@ one can reuse the first one's pin instead of a fresh Places call.
 
 Inputs come from the consignment document:
 
-  receiver.fullAddress           raw label text (preferred for matching)
-  receiver.address               OCR-formatted address (fallback)
+  receiver.fullAddress           raw label text (fallback only; matching is building-level)
+  receiver.address               cleaned address, no unit (what we match on)
   receiver.phone                 receiver's phone - the ONLY phone source used
   receiver.addressComponent      postal_code, premise, sub_premise, locality, city
 
@@ -176,7 +176,10 @@ def consignment_match_info(receiver: dict) -> dict:
 
     formatted = normalize_to_single_line(str(receiver.get("address") or ""))
     raw = normalize_to_single_line(str(receiver.get("fullAddress") or ""))
-    match_address = raw or formatted
+    # Building-level matching: `address` (the cleaned geocoding string, unit /
+    # floor stripped) is what we compare. fullAddress is only a fallback for
+    # records that have no `address`.
+    match_address = formatted or raw
 
     # Receiver's phone only (string or list) - never numbers from the text.
     phone_field = receiver.get("phone")
@@ -187,9 +190,7 @@ def consignment_match_info(receiver: dict) -> dict:
     postal = str(comp.get("postal_code") or "").strip()
     pincode = postal if PINCODE_RE.fullmatch(postal) else extract_pincode(raw, formatted)
 
-    extra_numbers = " ".join(
-        str(comp.get(k) or "") for k in ("premise", "sub_premise")
-    )
+    extra_numbers = str(comp.get("premise") or "")   # building no.; not the unit
     key = match_key(f"{match_address} {extra_numbers}")
     locality_words = match_key(
         f"{comp.get('locality') or ''} {comp.get('city') or ''}"
@@ -261,7 +262,10 @@ def drs_match(new: dict, entry: dict) -> Optional[str]:
             and is_precise(b_key, entry.get("locality_words"))):
         return None
 
-    if na != nb:
+    # Building-level: one side missing a door number the other has is fine
+    # (same building written with fewer details); two DIFFERENT numbers are
+    # different buildings.
+    if na and nb and not (na <= nb or nb <= na):
         return None
 
     return _text_match(a_key, b_key)

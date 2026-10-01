@@ -49,7 +49,7 @@ KUMMARY_HAND = ("#31, 2nd Flore Doctor Narayanaswamy layout, Opp Ayyappa Swamy T
 KUMMARY_PRINT = ("#31,2nd Flore Doctor Narayanaswamy Layout,Opp Ayyappa Swamy Temple,"
                  "Kodathi Village,Sarjapura Road,Banglore Banglore - 560035")
 KUMMARY_BRAND = "JetMax || Kidscare || Pulsecare || Spectra " + KUMMARY_PRINT
-KUMMARY_OCR = "Doctor Narayanaswamy Layout, Kodathi, Bengaluru, Karnataka 560035, India"
+KUMMARY_OCR = "No 31, Doctor Narayanaswamy Layout, Kodathi, Bengaluru, Karnataka 560035, India"
 
 COMP = {"city": "Bengaluru", "locality": "Kodathi", "postal_code": "560035",
         "premise": "", "sub_premise": ""}
@@ -89,9 +89,9 @@ class MatchKeyTests(unittest.TestCase):
 
 
 class ConsignmentMatchInfoTests(unittest.TestCase):
-    def test_prefers_full_address_and_reads_receiver_phone(self):
+    def test_matches_on_cleaned_address_and_reads_receiver_phone(self):
         i = info(LIKHITHA_1)
-        self.assertEqual(i["match_address"], LIKHITHA_FULL)
+        self.assertEqual(i["match_address"], LIKHITHA_OCR)
         self.assertEqual(i["phones"], ["8792767027"])
         self.assertEqual(i["pincode"], "560035")
 
@@ -103,9 +103,9 @@ class ConsignmentMatchInfoTests(unittest.TestCase):
         r = dict(LIKHITHA_1, phone=["+91 87927 67027", "junk"])
         self.assertEqual(info(r)["phones"], ["8792767027"])
 
-    def test_falls_back_to_formatted_address(self):
-        r = dict(LIKHITHA_1, fullAddress="")
-        self.assertEqual(info(r)["match_address"], LIKHITHA_OCR)
+    def test_falls_back_to_full_address_when_no_cleaned_address(self):
+        r = dict(LIKHITHA_1, address="")
+        self.assertEqual(info(r)["match_address"], LIKHITHA_FULL)
 
     def test_premise_numbers_count_as_door_numbers(self):
         r = receiver(LIKHITHA_OCR, LIKHITHA_OCR)
@@ -132,8 +132,8 @@ class DrsMatchTests(unittest.TestCase):
 
     def test_kummary_all_three(self):
         self.assertMatch(KUMMARY_1, KUMMARY_2)
-        self.assertMatch(KUMMARY_1, KUMMARY_3, "contained")   # no phone on #3
-        self.assertMatch(KUMMARY_2, KUMMARY_3, "contained")
+        self.assertMatch(KUMMARY_1, KUMMARY_3, "exact")   # no phone on #3
+        self.assertMatch(KUMMARY_2, KUMMARY_3, "exact")
 
     def test_likhitha_vs_kummary(self):
         self.assertNoMatch(LIKHITHA_1, KUMMARY_1)
@@ -147,11 +147,11 @@ class DrsMatchTests(unittest.TestCase):
         self.assertNoMatch(receiver("", LIKHITHA_OCR), receiver("", LIKHITHA_OCR))
 
     def test_different_house_same_layout(self):
-        decoy = receiver(KUMMARY_HAND.replace("#31", "#32"), KUMMARY_OCR)
+        decoy = receiver("", KUMMARY_OCR.replace("31", "32"))
         self.assertNoMatch(KUMMARY_3, decoy)
 
     def test_house_number_vs_no_house_number(self):
-        decoy = receiver("Kodathi Village, Sarjapura Road, Bangalore 560035", KUMMARY_OCR)
+        decoy = receiver("", "Kodathi Village, Sarjapura Road, Bangalore 560035")
         self.assertNoMatch(KUMMARY_3, decoy)
 
     def test_different_pincode_blocks_even_same_phone(self):
@@ -160,50 +160,40 @@ class DrsMatchTests(unittest.TestCase):
         self.assertNoMatch(LIKHITHA_1, other)
 
     # --- Shahi Exports / AKR, Ambalipura DRS (dev, 2026-10-01) ---------------
-    # Same building written "Unit-17A" and "Unit 17": was split into two memo
-    # groups (and two geocode_cache docs) because the door numbers differed.
-    def test_unit_suffix_letter_is_same_building(self):
-        a = receiver("Unit-17A, 18/2A, AKR, Sarjapur Road, Bellandur Gate, Ambalipura, "
-                     "Bengaluru, Karnataka 560102, India", "AKR, Ambalipura, Sarjapur Road",
-                     "9025509592")
-        b = receiver("Unit -17 AKR, #18/2A, Sarjapur Road, Bellandur Gate, Ambaipura, "
-                     "Bangalore, 560102, India", "Ambaipura, Sarjapur Road", "9901913551")
-        self.assertMatch(a, b)
+    # Matching is building-level: unit / floor details are NOT compared, so the
+    # same building written many ways is one place.
+    SHAHI_A = ("Shahi Exports Pvt. Ltd., Ambalipura, Sarjapur Road, Bellandur Gate, "
+               "Bangalore, Karnataka 560102, India")
+    SHAHI_B = ("SHAHI EXPORT [P] LTD., AMBAIPURA, SARJAPUR MAIN ROAD, BELLANDUR GATE, "
+               "BANGALORE, Karnataka 560102, India")
 
-    def test_different_unit_number_still_differs(self):
-        a = receiver("Unit 17, 18/2A, AKR, Sarjapur Road, Bellandur Gate, Ambalipura, "
-                     "Bengaluru 560102", "x", None)
-        b = receiver("Unit 18, 18/2A, AKR, Sarjapur Road, Bellandur Gate, Ambalipura, "
-                     "Bengaluru 560102", "x", None)
-        self.assertNoMatch(a, b)
+    def test_company_spelling_variants_are_same_building(self):
+        self.assertMatch(receiver("", self.SHAHI_A, "9025509592"),
+                         receiver("", self.SHAHI_B, "9901913551"))
+
+    def test_unit_inside_full_address_is_ignored(self):
+        a = receiver("Unit 17, 18/2A, " + self.SHAHI_A, self.SHAHI_A, None)
+        b = receiver("Unit 18, 5, " + self.SHAHI_A, self.SHAHI_A, None)
+        self.assertMatch(a, b, "exact")
+
+    def test_spaced_slash_and_missing_door_number_still_match(self):
+        a = receiver("", "Shahi Exports Pvt Ltd, AKR 18 / 2A, Ambalipura, Sarjapur Main Road, "
+                         "Bellandur Gate, Bengaluru, Karnataka 560102, India", None)
+        self.assertMatch(a, receiver("", self.SHAHI_A, None))
 
     def test_ocr_spelling_variants_normalise(self):
         self.assertEqual(match_key("Ambaipura Belandur Benglore"),
                          match_key("Ambalipura Bellandur Bengaluru"))
-
-    def test_same_phone_missing_unit_number_is_same_building(self):
-        # "Unit 17" (no 18/2A) vs "Unit 17, 18/2A", same phone: was split.
-        full = receiver("Unit 17, 18/2A, Sarjapur Road, Bellandur Gate, Ambalipura, Bangalore, "
-                        "Karnataka 560102, India", "x", "9515505560")
-        part = receiver("Unit 17, Sarjapur Road, Bellandur Gate, Ambalipura, Bangalore, "
-                        "Karnataka 560102, India", "x", "9515505560")
-        self.assertMatch(full, part, "phone")
-
-    def test_missing_unit_number_without_shared_phone_still_differs(self):
-        full = receiver("Unit 17, 18/2A, Sarjapur Road, Bellandur Gate, Ambalipura, Bangalore, "
-                        "Karnataka 560102, India", "x", "9515505560")
-        part = receiver("Unit 17, Sarjapur Road, Bellandur Gate, Ambalipura, Bangalore, "
-                        "Karnataka 560102, India", "x", "8074003657")
-        self.assertNoMatch(full, part)
 
     def test_door_suffix_loose_key_leaves_ordinals_alone(self):
         from app.services.address_match import loose_key
         self.assertEqual(loose_key("17a 18/2a 2nd 140/1"), "17 18/2 2nd 140/1")
 
     def test_same_phone_different_door_numbers(self):
-        home = receiver("No 12, 3rd Cross, Kodathi Village, Bangalore 560035", LIKHITHA_OCR,
-                        "8792767027")
-        self.assertNoMatch(LIKHITHA_1, home)
+        shop = receiver("", "No 140/1, Kodathi Village Main Road, Kodathi Gate, Bangalore "
+                            "560035", "8792767027")
+        home = receiver("", "No 12, 3rd Cross, Kodathi Village, Bangalore 560035", "8792767027")
+        self.assertNoMatch(shop, home)
 
 
 # --- In-memory Firestore for the memo ----------------------------------------
@@ -346,7 +336,7 @@ class GeocodeOrderTests(unittest.TestCase):
         self.assertEqual((out[0]["latitude"], places.call_count), (12.8801, 1))
 
     def test_new_spelling_gets_grouped_cache_entry(self):
-        variant = dict(KUMMARY_3, address="Kodathi, " + KUMMARY_OCR)
+        variant = dict(KUMMARY_3, address="Opp Ayyappa Swamy Temple, " + KUMMARY_OCR)
         self._geocode(KUMMARY_1, "C1")
         save_mod.save_to_cache.reset_mock()
         self._geocode(variant, "C2")
@@ -369,7 +359,7 @@ class GeocodeOrderTests(unittest.TestCase):
         verified = {"latitude": 1.0, "longitude": 2.0, "types": []}
         self._geocode(KUMMARY_1, "C1", cache=(verified, "exact_hit"))
         save_mod.save_to_cache.reset_mock()
-        variant = dict(KUMMARY_3, address="Kodathi, " + KUMMARY_OCR)
+        variant = dict(KUMMARY_3, address="Opp Ayyappa Swamy Temple, " + KUMMARY_OCR)
         (_r, _, _, outcome, _cls), _ = self._geocode(variant, "C2")   # cache miss -> memo
         self.assertEqual(outcome, "drs_hit")
         save_mod.save_to_cache.assert_not_called()
