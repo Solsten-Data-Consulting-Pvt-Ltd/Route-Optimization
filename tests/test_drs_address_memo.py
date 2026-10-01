@@ -195,6 +195,12 @@ class DrsMatchTests(unittest.TestCase):
         home = receiver("", "No 12, 3rd Cross, Kodathi Village, Bangalore 560035", "8792767027")
         self.assertNoMatch(shop, home)
 
+    def test_same_phone_unrelated_address_same_pincode_does_not_merge(self):
+        a = receiver("", "Kodathi Village Main Road, Kodathi Gate, Bangalore 560035", "8792767027")
+        b = receiver("", "Prestige Tech Park, Outer Ring Road, Marathahalli, Bangalore 560035",
+                     "8792767027")
+        self.assertNoMatch(a, b)
+
 
 # --- In-memory Firestore for the memo ----------------------------------------
 def _resolve(value, existing):

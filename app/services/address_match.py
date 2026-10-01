@@ -40,6 +40,7 @@ from app.config import (
     DRS_MEMO_CONTAINMENT_RATIO,
     DRS_MEMO_FUZZY_THRESHOLD,
     DRS_MEMO_MIN_CONTAINED_TOKENS,
+    DRS_MEMO_PHONE_MIN_TEXT_SIMILARITY,
 )
 from app.services.address import normalize_to_single_line
 
@@ -256,6 +257,11 @@ def drs_match(new: dict, entry: dict) -> Optional[str]:
         # building, written with fewer details.
         if na and nb and not (na <= nb or nb <= na):
             return None          # same person, different building (shop vs home)
+        # A phone alone is not proof: the two addresses must also read alike
+        # (shared road / locality / company words), so one person with two
+        # unrelated addresses in the same pincode is not merged.
+        if fuzz.token_set_ratio(a_key, b_key) < DRS_MEMO_PHONE_MIN_TEXT_SIMILARITY:
+            return None
         return "phone"
 
     if not (is_precise(a_key, new.get("locality_words"))

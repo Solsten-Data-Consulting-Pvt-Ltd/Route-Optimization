@@ -22,6 +22,7 @@ DRS_MEMO_TTL_DAYS = 2
 DRS_MEMO_FUZZY_THRESHOLD = 90
 DRS_MEMO_CONTAINMENT_RATIO = 0.9
 DRS_MEMO_MIN_CONTAINED_TOKENS = 5
+DRS_MEMO_PHONE_MIN_TEXT_SIMILARITY = 60  # shared phone also needs this much text overlap
 
 # Feature flags: the 3PL featureFlags collection (same Firestore project).
 FEATURE_FLAGS_COLLECTION = "featureFlags"
