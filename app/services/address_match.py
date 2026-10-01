@@ -76,6 +76,16 @@ WORD_VARIANTS = {
     "nr": "",
 }
 
+# Company-name spelling variants ("Exports" vs "Export", "Private" vs "Pvt").
+# Legal-form words ("pvt ltd") say nothing about WHICH place, so they are
+# dropped from the match key; business words are reduced to one spelling.
+LEGAL_WORDS = {"pvt", "ltd", "private", "limited", "llp"}
+BUSINESS_WORD_VARIANTS = {
+    "exports": "export", "imports": "import", "enterprises": "enterprise",
+    "industries": "industry", "traders": "trader", "company": "co",
+}
+BRACKET_P_RE = re.compile(r"[\[(]\s*p\s*[\])]")
+
 # Words that say nothing about WHICH building on a road.
 GENERIC_WORDS = {
     "road", "main", "cross", "street", "village", "gate", "layout", "nagar",
@@ -92,9 +102,13 @@ def match_key(address: str) -> str:
     s = address.lower()
     s = MOBILE_IN_TEXT_RE.sub(" ", s)
     s = PINCODE_RE.sub(" ", s)
+    s = BRACKET_P_RE.sub(" pvt ", s)     # "Export [P] Ltd" == "Export Pvt Ltd"
     s = re.sub(r"[^a-z0-9/]+", " ", s)
     out = []
     for token in s.split():
+        if token in LEGAL_WORDS:
+            continue
+        token = BUSINESS_WORD_VARIANTS.get(token, token)
         token = CITY_VARIANTS.get(token, token)
         token = WORD_VARIANTS.get(token, token)
         token = token.strip("/")

@@ -133,6 +133,20 @@ CACHED_RESULT_FIELDS = (
 _snapshot = {"loaded_at": 0.0, "entries": None}
 
 
+# Company-name spelling variants. Mirrored in 3PL geocodeAddress.js.
+COMPANY_VARIANTS = (
+    (re.compile(r"[\[(]\s*p\s*[\])]"), "pvt"),
+    (re.compile(r"\bpvt\b\.?"), "pvt"),
+    (re.compile(r"\bprivate\b"), "pvt"),
+    (re.compile(r"\bltd\b\.?"), "ltd"),
+    (re.compile(r"\blimited\b"), "ltd"),
+    (re.compile(r"\bexports\b"), "export"),
+    (re.compile(r"\bimports\b"), "import"),
+    (re.compile(r"\benterprises\b"), "enterprise"),
+    (re.compile(r"\bindustries\b"), "industry"),
+)
+
+
 def normalize_address(address: str) -> str:
     if not address:
         return ""
@@ -140,6 +154,8 @@ def normalize_address(address: str) -> str:
     s = re.sub(r"[,\s]+", " ", s)
     s = PINCODE_RE.sub("", s)      # strip any 6-digit pincode, not just 560xxx
     s = PLUS_CODE_RE.sub("", s)    # Fix 2: strip Google Plus Codes
+    for pattern, canonical in COMPANY_VARIANTS:
+        s = pattern.sub(canonical, s)
     for variant, canonical in CITY_VARIANTS.items():
         s = re.sub(r"\b" + re.escape(variant) + r"\b", canonical, s)
     # Fix 3: normalise building-name abbreviations (longer form -> compact form)
