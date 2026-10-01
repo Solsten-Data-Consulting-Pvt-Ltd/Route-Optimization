@@ -74,6 +74,18 @@ class CacheMetricsTests(unittest.TestCase):
             75.0,
         )
 
+    def test_hit_rate_counts_same_drs_reuse(self):
+        client = _FakeClient()
+        metrics = {"drs-a": {
+            "drsNo": "100", "consignmentsProcessed": 8, "invalidAddresses": 0,
+            "cacheLookups": 8, "exactHits": 0, "fuzzyHits": 0, "drsHits": 6,
+            "misses": 2, "cacheErrors": 0, "apiCalls": 2, "apiFailures": 0,
+        }}
+        with patch("app.db.cache_metrics.get_fs_client", return_value=client):
+            write_drs_cache_metrics(metrics, datetime(2026, 9, 21, tzinfo=timezone.utc))
+        payload = client.batch_instance.writes[0][1]
+        self.assertEqual(payload["hitRate"], 75.0)
+
 
 if __name__ == "__main__":
     unittest.main()

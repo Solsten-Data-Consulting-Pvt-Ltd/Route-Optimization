@@ -31,7 +31,8 @@ def write_drs_cache_metrics(
 
     for drs_id, counts in metrics_by_drs.items():
         lookups = counts["cacheLookups"]
-        hits = counts["exactHits"] + counts["fuzzyHits"]
+        # Same-DRS reuse also avoids a Places call, so it counts as a hit.
+        hits = counts["exactHits"] + counts["fuzzyHits"] + counts.get("drsHits", 0)
         payload = {
             "runId": run_id,
             "drsId": drs_id,
