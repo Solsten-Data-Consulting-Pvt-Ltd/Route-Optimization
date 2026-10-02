@@ -422,6 +422,32 @@ class PipelineScenarioTests(unittest.TestCase):
         self.assertEqual(places.call_count, 0)
 
 
+    def test_second_correction_of_same_place_replaces_the_first(self):
+        # Regression: a dragged pin tied with the existing exec_corrected memo
+        # entry and the OLD pin was reused, so the new pin never got saved.
+        store = FakeMemoStore()
+        merged = []
+        for lat, lng in ((12.5, 77.5), (13.1, 77.8)):
+            docs = [_Doc("L1", LIKHITHA_1)]
+            conf = {"L1": ConfirmedLocation(latitude=lat, longitude=lng,
+                                            corrected=True, overriddenBy="ADMIN1")}
+            with patch.object(drs_memo, "_doc", side_effect=store.doc), \
+                 patch.object(save_mod, "get_consignments_by_id", return_value=(docs, [])), \
+                 patch.object(save_mod, "get_cached_geocode_with_outcome",
+                              return_value=({"latitude": 1.0, "longitude": 1.0, "types": []}, "exact_hit")), \
+                 patch.object(save_mod, "places_search_address", side_effect=fake_places), \
+                 patch.object(save_mod, "save_to_cache"), \
+                 patch.object(save_mod, "merge_routing_rows") as merge, \
+                 patch.object(save_mod, "fetch_rows_by_consignment_drs_pairs", return_value=[]), \
+                 patch.object(save_mod, "deactivate_stale_routing_rows"), \
+                 patch.object(save_mod, "upsert_consignments_routing"), \
+                 patch.object(save_mod, "write_drs_cache_metrics"):
+                save_mod.save_consignments_pipeline(["L1"], confirmed_locations=conf)
+            merged.append({r["consignmentId"]: r for r in merge.call_args.args[0]}["L1"])
+        self.assertEqual((merged[0]["latitude"], merged[0]["longitude"]), (12.5, 77.5))
+        self.assertEqual((merged[1]["latitude"], merged[1]["longitude"]), (13.1, 77.8))
+
+
 class PreviewContextTests(unittest.TestCase):
     def test_consignment_id_supplies_phone_and_drs(self):
         with patch.object(save_mod, "get_consignments_by_id",

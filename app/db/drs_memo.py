@@ -187,7 +187,7 @@ def reconcile(drs_id, info: dict, result: dict, source: str, *,
 
     Returns (authoritative_result, entry_id):
       - if a same-place entry already exists and is at least as trustworthy
-        as `source`, that entry's own pin is returned (and `consignment_id`
+        as `source` (a new human correction beats an equal-rank one), that entry's own pin is returned (and `consignment_id`
         is linked to it) - callers should persist THIS result, not their
         own, so the saved row agrees with the rest of the group.
       - otherwise `result` is persisted (upgrading the matched entry in
@@ -206,7 +206,16 @@ def reconcile(drs_id, info: dict, result: dict, source: str, *,
     hit = find_match(entries, info)
     if hit:
         match_id, entry, _reason = hit
-        if _SOURCE_PRIORITY.get(entry.get("source"), 0) >= _SOURCE_PRIORITY.get(source, 0):
+        existing_rank = _SOURCE_PRIORITY.get(entry.get("source"), 0)
+        new_rank = _SOURCE_PRIORITY.get(source, 0)
+        # A tie normally goes to the existing entry, EXCEPT for an explicit
+        # human correction (a dragged pin): that must replace an earlier
+        # correction of the same place, otherwise a second drag is silently
+        # discarded and the old pin comes back on the next optimize.
+        keep_existing = existing_rank > new_rank or (
+            existing_rank == new_rank and source != SOURCE_EXEC_CORRECTED
+        )
+        if keep_existing:
             # Existing entry is at least as trustworthy - reuse its pin
             # instead of drifting off on this consignment's own point.
             link(drs_id, match_id, lookup_address=lookup_address, consignment_id=consignment_id,
