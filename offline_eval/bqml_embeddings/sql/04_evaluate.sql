@@ -1,5 +1,9 @@
 -- §5.5 — 04: offline replay + precision/recall, written to `results`.
 --
+-- Scopes: pincode (the address's own), pincode_neighbours (its own plus the
+-- reviewed/learned neighbouring pincodes from 02b — still a bounded set of
+-- partitions), geohash6 (the first resolved pin's cell).
+--
 -- Each labelled consignment Q in the last @query_days days is replayed as a
 -- new scan. It is compared ONLY with addresses whose truth was known before Q
 -- was created, inside Q's partition ({{scope}}):
@@ -26,7 +30,8 @@ queries AS (
   SELECT
     q.*,
     NOT (IFNULL(p.master_waypoint_hit, FALSE) OR IFNULL(p.geocache_hit, FALSE)) AS prior_tiers_missed,
-    p.address_key IS NOT NULL AS prior_checked
+    p.address_key IS NOT NULL AS prior_checked,
+    {{search_pincodes_expr}} AS search_pincodes   -- partitions this query may search
   FROM corpus AS q
   LEFT JOIN `{{eval}}.prior_tier_check` AS p USING (address_key)
   WHERE q.created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @query_days DAY)

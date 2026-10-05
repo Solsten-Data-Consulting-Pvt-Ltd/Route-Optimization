@@ -1,0 +1,6 @@
+{
+  "description": "Pincode pairs that share a border, where customers often write one and the place is in the other. Symmetric: list each pair once. Add pairs only after confirming them (an executive-verified pin, or the evaluation's learned pincode_neighbours table reviewed by ops). See app/services/pincode_neighbours.py.",
+  "pairs": [
+    ["560102", "560103", "HSR Layout / Bellandur: Ambalipura, Sarjapur Road (Shahi Exports) is in 560103 but often labelled 560102"]
+  ]
+}

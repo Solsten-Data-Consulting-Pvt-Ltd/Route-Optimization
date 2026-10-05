@@ -66,7 +66,16 @@ class ScopeConstraintTests(unittest.TestCase):
             with self.assertRaises(r.EvalError):
                 r.scope_params(bad)
         for spec in r.SCOPES.values():
-            self.assertRegex(spec["predicate"], r"^c\.\w+ = q\.\w+$")
+            # one partition, or a bounded list of pincode partitions
+            self.assertRegex(spec["predicate"],
+                             r"^c\.\w+ (= q\.\w+|IN UNNEST\(q\.search_pincodes\))$")
+
+    def test_neighbour_search_list_is_own_pincode_plus_its_neighbours_only(self):
+        expr = r.scope_params("pincode_neighbours", "p.d")["search_pincodes_expr"]
+        self.assertIn("[q.scope_pincode]", expr)
+        self.assertIn("FROM `p.d.pincode_neighbours` AS n WHERE n.pincode = q.scope_pincode", expr)
+        for scope in ("pincode", "geohash6"):
+            self.assertNotIn("pincode_neighbours", r.scope_params(scope)["search_pincodes_expr"])
 
     def test_render_rejects_missing_unused_or_empty_placeholders(self):
         with self.assertRaises(r.EvalError):
@@ -79,6 +88,36 @@ class ScopeConstraintTests(unittest.TestCase):
 
     def test_candidates_only_from_before_the_scan(self):
         self.assertIn("c.labelled_at < q.created_at", _sql()["evaluate"])
+
+
+class NeighbourTests(unittest.TestCase):
+    def test_seed_pairs_come_from_the_apps_reviewed_file(self):
+        pairs = r.load_seed_pairs(r.DEFAULT_NEIGHBOURS_FILE)
+        self.assertIn(("560102", "560103"), pairs)
+        self.assertEqual(r.load_seed_pairs(REPO / "no-such-file.json"), [])
+
+    def test_seed_sql_is_typed_and_validated(self):
+        self.assertEqual(r.seed_pairs_sql([]), "ARRAY<STRUCT<a STRING, b STRING>>[]")
+        self.assertEqual(r.seed_pairs_sql([("560102", "560103")]),
+                         "ARRAY<STRUCT<a STRING, b STRING>>[('560102', '560103')]")
+        with self.assertRaises(r.EvalError):
+            r.seed_pairs_sql([("560102'; DROP TABLE x; --", "560103")])
+
+    def test_neighbours_step_renders_and_runs_before_evaluate(self):
+        sql = _sql("pincode_neighbours")
+        self.assertIn("('560102', '560103')", sql["neighbours"])
+        self.assertIn("median_m <= @neighbour_max_m", sql["neighbours"])
+        self.assertIn("c.scope_pincode IN UNNEST(q.search_pincodes)", sql["evaluate"])
+        self.assertLess(r.STEPS.index("neighbours"), r.STEPS.index("evaluate"))
+        self.assertIn("neighbours", r.DEFAULT_STEPS)
+
+    def test_report_lists_learned_pairs_for_review(self):
+        meta = {"run_id": "x", "generated_at": "now", "scope": "pincode_neighbours",
+                "label_sources": ["routing_overrides"], "same_place_m": 50.0, "query_days": 30}
+        md = r.render_report(meta, [], None, None, 0.995,
+                             [{"pincode": "560034", "neighbour": "560095",
+                               "observations": 12, "median_m": 2300.0}])
+        self.assertIn("| 560034 | 560095 | 12 | 2.3 km |", md)
 
 
 class BlastRadiusTests(unittest.TestCase):

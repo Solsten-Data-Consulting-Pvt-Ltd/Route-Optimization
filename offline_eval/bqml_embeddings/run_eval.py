@@ -27,6 +27,7 @@ Usage:
 import argparse
 import bisect
 import csv
+import json
 import logging
 import os
 import re
@@ -43,20 +44,35 @@ SQL_DIR = HERE / "sql"
 REPORTS_DIR = HERE / "reports"
 
 DEFAULT_DATASET = "route_opt_eval"
-STEPS = ("setup", "corpus", "prior", "embed", "evaluate", "report")
-DEFAULT_STEPS = ("corpus", "prior", "embed", "evaluate", "report")
+STEPS = ("setup", "corpus", "neighbours", "prior", "embed", "evaluate", "report")
+DEFAULT_STEPS = ("corpus", "neighbours", "prior", "embed", "evaluate", "report")
+REPO_ROOT = HERE.parents[1]
+DEFAULT_NEIGHBOURS_FILE = REPO_ROOT / "app" / "data" / "pincode_neighbours.json"
+PINCODE_RE = re.compile(r"^\d{6}$")
 
-# The hard constraint (spec §5.5): every search is inside one partition.
-# `predicate` joins query q to candidate c; there is deliberately no
-# "unscoped"/"none" option.
+# The hard constraint (spec §5.5): every search is inside a bounded set of
+# partitions. `predicate` joins query q to candidate c; there is deliberately
+# no "unscoped"/"none" option. `search` is the list of pincode partitions a
+# query may search: its own, or its own plus its neighbouring pincodes
+# ({eval} is filled in by scope_params).
+_OWN_PINCODE = "IF(q.scope_pincode IS NULL, CAST([] AS ARRAY<STRING>), [q.scope_pincode])"
 SCOPES = {
     "pincode": {
         "predicate": "c.scope_pincode = q.scope_pincode",
         "query_not_null": "q.scope_pincode IS NOT NULL",
+        "search": _OWN_PINCODE,
+    },
+    "pincode_neighbours": {
+        "predicate": "c.scope_pincode IN UNNEST(q.search_pincodes)",
+        "query_not_null": "q.scope_pincode IS NOT NULL",
+        "search": ("IF(q.scope_pincode IS NULL, CAST([] AS ARRAY<STRING>), ARRAY_CONCAT("
+                   "[q.scope_pincode], ARRAY(SELECT n.neighbour FROM `{eval}.pincode_neighbours` AS n "
+                   "WHERE n.pincode = q.scope_pincode)))"),
     },
     "geohash6": {
         "predicate": "c.truth_geohash6 = q.initial_geohash6",
         "query_not_null": "q.initial_geohash6 IS NOT NULL",
+        "search": _OWN_PINCODE,
     },
 }
 
@@ -101,13 +117,38 @@ def render(template_name: str, **params) -> str:
     return text
 
 
-def scope_params(scope: str) -> dict:
+def scope_params(scope: str, eval_ds: str = "<eval>") -> dict:
     if scope not in SCOPES:
         raise EvalError(f"unknown scope {scope!r}; choose one of {sorted(SCOPES)} "
                         "(an unconstrained search is not an option, spec §5.5)")
     s = SCOPES[scope]
     return {"scope": scope, "scope_predicate": s["predicate"],
-            "query_scope_not_null": s["query_not_null"]}
+            "query_scope_not_null": s["query_not_null"],
+            "search_pincodes_expr": s["search"].replace("{eval}", eval_ds)}
+
+
+def load_seed_pairs(path) -> list:
+    """Reviewed neighbour pairs from app/data/pincode_neighbours.json (the same
+    file the live code reads). Missing file -> no seed pairs."""
+    path = Path(path) if path else None
+    if not path or not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    pairs = []
+    for pair in data.get("pairs") or []:
+        a, b = str(pair[0]).strip(), str(pair[1]).strip()
+        if PINCODE_RE.match(a) and PINCODE_RE.match(b) and a != b:
+            pairs.append((a, b))
+    return pairs
+
+
+def seed_pairs_sql(pairs) -> str:
+    """Typed array literal; pincodes are validated as 6 digits, so inlining is safe."""
+    for a, b in pairs:
+        if not (PINCODE_RE.match(a) and PINCODE_RE.match(b)):
+            raise EvalError(f"invalid pincode pair {(a, b)!r}")
+    items = ", ".join(f"('{a}', '{b}')" for a, b in pairs)
+    return f"ARRAY<STRUCT<a STRING, b STRING>>[{items}]"
 
 
 def run_tag(run_id: str) -> str:
@@ -217,7 +258,8 @@ def _pct(v):
     return "–" if v is None else f"{v * 100:.1f}%"
 
 
-def render_report(meta, rows, recommendation, coverage=None, min_precision=0.995):
+def render_report(meta, rows, recommendation, coverage=None, min_precision=0.995,
+                  learned_neighbours=None):
     lines = [
         "# §5.5 address-embedding evaluation",
         "",
@@ -251,6 +293,15 @@ def render_report(meta, rows, recommendation, coverage=None, min_precision=0.995
     lines += ["", "Precision = right calls / all \"same place\" calls (a wrong call sends a "
                   "parcel to the wrong building). Recall = right calls / queries that really had "
                   "a same-place address earlier in their partition.", ""]
+    if learned_neighbours:
+        lines += ["## Learned neighbouring pincodes — review before adding to "
+                  "`app/data/pincode_neighbours.json`", "",
+                  "| Written pincode | Pin actually in | Observations | Median distance from written pincode |",
+                  "|---|---|---:|---:|"]
+        for n in learned_neighbours:
+            lines.append(f"| {n['pincode']} | {n['neighbour']} | {n['observations']} | "
+                         f"{(n['median_m'] or 0) / 1000:.1f} km |")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -341,9 +392,12 @@ def build_sql(args, src, run_id):
                              src["label_sources"], delivery_audit_table=args.delivery_audit_table,
                              routing_table=args.routing_table,
                              has_corrected_cols=src["has_corrected_cols"])),
+        "neighbours": render("02b_pincode_neighbours.sql", eval=eval_ds,
+                             routing_table=args.routing_table,
+                             seed_pairs=seed_pairs_sql(load_seed_pairs(args.neighbours_file))),
         "embed": render("03_embed.sql", eval=eval_ds),
         "evaluate": render("04_evaluate.sql", eval=eval_ds, run_id=run_id, run_tag=tag,
-                           **scope_params(args.scope)),
+                           **scope_params(args.scope, eval_ds)),
         "mistakes": render("05_mistakes.sql", eval=eval_ds, run_tag=tag),
     }
 
@@ -402,6 +456,12 @@ def parse_args(argv=None):
     p.add_argument("--same-place-m", type=float, default=50.0)
     p.add_argument("--accurate-within-m", type=float, default=100.0)
     p.add_argument("--min-precision", type=float, default=0.995)
+    p.add_argument("--neighbours-file", default=str(DEFAULT_NEIGHBOURS_FILE),
+                   help="reviewed neighbour pairs (same file the app reads)")
+    p.add_argument("--min-pair-count", type=int, default=5,
+                   help="observations needed to learn a neighbouring-pincode pair")
+    p.add_argument("--neighbour-max-m", type=float, default=6000.0,
+                   help="learned pair: median distance of its pins from the written pincode")
     p.add_argument("--mistakes-threshold", type=float, default=None)
     p.add_argument("--run-id", default=None)
     p.add_argument("--dry-run", action="store_true", help="print the SQL; touch nothing")
@@ -446,6 +506,9 @@ def main(argv=None) -> int:
         if "corpus" in args.steps:
             _run(client, sql["corpus"], args, history_days=args.history_days,
                  accurate_within_m=args.accurate_within_m)
+        if "neighbours" in args.steps:
+            _run(client, sql["neighbours"], args, history_days=args.history_days,
+                 min_pair_count=args.min_pair_count, neighbour_max_m=args.neighbour_max_m)
         if "prior" in args.steps:
             _prior_step(client, args)
         if "embed" in args.steps:
@@ -463,12 +526,14 @@ def main(argv=None) -> int:
         if "report" in args.steps:
             rows = _fetch_results(client, args, run_id)
             rec = choose_threshold(rows, min_precision=args.min_precision)
+            learned = _fetch_learned_neighbours(client, args)
             meta = {"run_id": run_id, "scope": args.scope, "label_sources": src["label_sources"],
                     "same_place_m": args.same_place_m, "query_days": args.query_days,
                     "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
             REPORTS_DIR.mkdir(exist_ok=True)
             md = REPORTS_DIR / f"{run_tag(run_id)}.md"
-            md.write_text(render_report(meta, rows, rec, coverage, args.min_precision), encoding="utf-8")
+            md.write_text(render_report(meta, rows, rec, coverage, args.min_precision, learned),
+                          encoding="utf-8")
             with open(REPORTS_DIR / f"{run_tag(run_id)}.csv", "w", newline="", encoding="utf-8") as fh:
                 writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()) if rows else ["slice"])
                 writer.writeheader()
@@ -498,6 +563,20 @@ def _fetch_results(client, args, run_id):
         f"wrong_building, precision, recall FROM `{args.project}.{args.dataset}.results` "
         f"WHERE run_id = @run_id", job_config=config)
     return [dict(r.items()) for r in job.result()]
+
+
+
+def _fetch_learned_neighbours(client, args):
+    from google.api_core.exceptions import NotFound
+    try:
+        job = client.query(
+            f"SELECT pincode, neighbour, observations, median_m "
+            f"FROM `{args.project}.{args.dataset}.pincode_neighbours` "
+            f"WHERE source = 'learned' AND pincode < neighbour "
+            f"ORDER BY observations DESC LIMIT 50")
+        return [dict(r.items()) for r in job.result()]
+    except NotFound:
+        return []
 
 
 if __name__ == "__main__":

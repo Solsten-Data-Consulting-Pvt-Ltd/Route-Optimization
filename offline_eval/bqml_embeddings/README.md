@@ -14,6 +14,7 @@ Dockerfile copies only `app/`).
 |---|---|---|
 | `setup` | `sql/00_setup.sql` | dataset `route_opt_eval` + BQML remote model over `text-embedding-005` |
 | `corpus` | `sql/01_labels_*.sql`, `sql/02_corpus.sql` | `corpus`: every consignment whose true pin is known, with its normalised address text, address pincode, geohash-6 and door numbers |
+| `neighbours` | `sql/02b_pincode_neighbours.sql` | `pincode_neighbours`: neighbouring-pincode pairs — the reviewed ones from `app/data/pincode_neighbours.json` plus pairs learned from your data (listed in the report for review) |
 | `prior` | `run_eval.py` (`prior_tier_hits`) | `prior_tier_check`: would master-waypoint or the verified geocache have answered it at scan time? Uses the live code's own `normalize_address` and the 85 `token_sort_ratio` cutoff |
 | `embed` | `sql/03_embed.sql` | `embeddings`: `ML.GENERATE_EMBEDDING`, `task_type = 'SEMANTIC_SIMILARITY'`; incremental, only new/changed text is sent |
 | `evaluate` | `sql/04_evaluate.sql` | replays the last `--query-days` days: each consignment against addresses labelled **before** it, **in its own partition**; nearest by cosine distance; scored per threshold into `results` |
@@ -38,6 +39,7 @@ Two consignments are "the same place" when their true pins are within `--same-pl
 ## Scopes
 
 - `pincode` (default) — the realistic live setting: the pincode is in the scanned text before any geocoding.
+- `pincode_neighbours` — the written pincode **plus its neighbouring pincodes** (from the `neighbours` step). For labels like Shahi Exports, Ambalipura: written 560102, really 560103. Still a bounded set of partitions, never the whole corpus. Run it next to `pincode` to see how many repeats the written pincode alone misses.
 - `geohash6` — partition = geohash-6 of the consignment's **first** resolved pin (`planned_latitude/longitude`). This measures "re-check a Places pin against known places nearby" (a §5.1 assist), not API savings, since a pin already exists. Requires those columns.
 
 ## Running it (dev first)
@@ -62,6 +64,10 @@ Two consignments are "the same place" when their true pins are within `--same-pl
 4. **Read the report**, then `reports/<run>_mistakes.csv` — every wrong-building call at the recommended threshold. Those decide go/no-go, not the averages.
 
 Cost: embeddings are billed per character sent (each address once; re-runs only send new text); the evaluation join is bounded by partition sizes. Turn the flag off afterwards.
+
+## Neighbouring pincodes
+
+A pair (A, B) is **learned** when at least `--min-pair-count` (5) saved pins whose label says A sit in Google's pincode B, and those pins are typically (median) within `--neighbour-max-m` (6 km) of where A really is: the centroid of pins whose label and Google pincode agree. The distance test separates "the pincode next door" from wrong pins across the city. Learned pairs appear at the end of the report. Once a person has checked them, add them to `app/data/pincode_neighbours.json`, which is the same file the live code uses (`app/services/pincode_neighbours.py`).
 
 ## Reading the result
 
