@@ -6,3 +6,6 @@ venv/
 env-vars.yaml
 .cache/
 desktop.ini
+
+# §5.5 offline evaluation output
+offline_eval/bqml_embeddings/reports/

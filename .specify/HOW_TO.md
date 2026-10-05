@@ -69,7 +69,8 @@ There's no admin screen for this yet — today it's a manual edit in the Firesto
 ## What's built vs. what's still just written down
 
 - **Built and tested today:** §5.3 (master-waypoint tier), §5.6 (feature flags). Off by default in prod.
-- **Written in `spec.md` but not built yet:** §5.1 (geocoding ambiguity → HILT), §5.2 (solitary-outlier trap), §5.4 (EOD feedback endpoint), §5.5 (BQML embeddings evaluation). Each has its own section in `spec.md` with what it'll touch and the risk involved — read that section before starting it, the same way this round did for §5.3/§5.6.
+- **Built as an offline evaluation:** §5.5 (BQML embeddings) — `offline_eval/bqml_embeddings/`, runbook in its README. Never part of the deployed app; needs the Vertex AI connection and the `bqml_embeddings_eval` flag to run.
+- **Written in `spec.md` but not built yet:** §5.1 (geocoding ambiguity → HILT), §5.2 (solitary-outlier trap), §5.4 (EOD feedback endpoint). Each has its own section in `spec.md` with what it'll touch and the risk involved — read that section before starting it, the same way this round did for §5.3/§5.6.
 - Before starting any of those: check `spec.md` §8 (Tech Debt) — a couple of items there (unparameterized SQL in `bigquery.py`, no test coverage on `sorting.py`) are flagged as things to fix *as part of* §5.2 specifically, not separately.
 
 ## The one rule worth remembering

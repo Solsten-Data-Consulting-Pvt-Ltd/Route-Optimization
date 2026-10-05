@@ -2,7 +2,7 @@
 
 **Purpose of this document:** this is a **developer aid**, not just a requirements list. None of the terms and concepts below (master waypoint, HILT, the solitary-outlier trap, "Anchor & Hitchhiker") exist anywhere in this repository, its README, or any other written source today — they only exist in the conversation that produced this document (plus one prior Gemini chat). This file is now the single source of truth for them. Read the Glossary before the rest; it's referenced throughout.
 
-**Status:** §5.6 (Config & feature flags) and §5.3 (Master-waypoint tier) are **implemented**, flag-gated, default OFF (see `app/db/feature_flags.py`, `app/db/master_waypoint.py`, wired into `app/services/save.py:_geocode()`; tests in `tests/test_feature_flags.py`, `tests/test_master_waypoint.py`). §5.1, §5.2, §5.4, §5.5 remain planned, not built. If you're new to how this doc leads to shipped code, read `.specify/HOW_TO.md` first.
+**Status:** §5.6 (Config & feature flags) and §5.3 (Master-waypoint tier) are **implemented**, flag-gated, default OFF (see `app/db/feature_flags.py`, `app/db/master_waypoint.py`, wired into `app/services/save.py:_geocode()`; tests in `tests/test_feature_flags.py`, `tests/test_master_waypoint.py`). §5.5 (BQML embeddings evaluation) is **built as an offline pipeline** in `offline_eval/bqml_embeddings/`, gated by `bqml_embeddings_eval`, not wired into any production path (tests in `tests/test_bqml_embeddings_eval.py`). §5.1, §5.2, §5.4 remain planned, not built. If you're new to how this doc leads to shipped code, read `.specify/HOW_TO.md` first.
 
 ---
 
@@ -215,7 +215,7 @@ Processing (new function, e.g. `app/services/eod_feedback.py`, called from a new
 
 **Blast radius:** new router + service module + schema + BQ table. Zero changes to `save.py`/`sorting.py`/`tsp.py` — this is a new, independent ingestion path that only *feeds* §5.3's promotion rule and §5.5's training data.
 
-### 5.5 BQML / vector-search embeddings evaluation
+### 5.5 BQML / vector-search embeddings evaluation — **evaluation pipeline built**, flag `bqml_embeddings_eval`
 
 - `ML.GENERATE_EMBEDDING` with `text-embedding-005`, `task_type = 'SEMANTIC_SIMILARITY'`, called through a BQML remote model over a Vertex AI connection (see §2 for references).
 - **Hard constraint, unchanged from the original ask:** never search unconstrained. Every `VECTOR_SEARCH`/`ML.DISTANCE` call is pre-scoped to a postal code or geohash-6 partition, and only runs after both the master-waypoint tier (§5.3) and `geocache.py`'s exact/fuzzy lookup have missed.
@@ -223,6 +223,14 @@ Processing (new function, e.g. `app/services/eod_feedback.py`, called from a new
 - This is an **evaluation phase**, not a committed production path: deliverable is a BQML pipeline + an offline precision/recall report, gating a later decision to wire it into the live save-consignments flow.
 
 **Blast radius:** new BQ dataset/table for embeddings, a BQML remote model resource, a Vertex AI connection (GCP infra, provisioned outside application code), and an offline evaluation script outside `app/`. No production code path calls `ML.GENERATE_EMBEDDING` in this phase.
+
+**As built** (`offline_eval/bqml_embeddings/`, runbook in its `README.md`):
+
+- **Pipeline:** `setup` (dataset `route_opt_eval` + remote model) → `corpus` (labelled addresses, normalised text, address pincode, geohash-6, door numbers) → `prior` (would master-waypoint or the verified geocache have answered at scan time — computed with the live `normalize_address` and the 85 `token_sort_ratio` cutoff) → `embed` (`ML.GENERATE_EMBEDDING`, incremental) → `evaluate` (replay of the last 30 days, `ML.DISTANCE` cosine) → `report` (markdown + CSV + a list of every wrong-building call).
+- **Scoping:** the only `ML.DISTANCE` sits in a join on the partition predicate — `pincode` (the pincode written in the address, known before geocoding; default) or `geohash6` (the first resolved pin; measures a §5.1 assist, not API savings). There is no unscoped option; addresses without a pincode are counted and never searched. Candidates must be labelled before the replayed consignment was created, so the replay cannot see the future. Tests fail if any SQL searches without the predicate, or if anything under `app/` references the evaluation.
+- **Ground truth:** `delivery_audit` (§5.4) — `reasonCode` A/D → corrected pin (else driver GPS); no reason code and delivered within 100 m of plan → the plan was right; B/C/NOT_PROVIDED → no label. Until §5.4 exists, executive/admin hand-placed pins (`locationOverridden = TRUE`) are used. "Same place" = true pins within 50 m. The runner checks `delivery_audit` for the §5.4 column names (`consignmentId`, `drsNo`, `plannedLatitude`, `plannedLongitude`, `actualLatitude`, `actualLongitude`, `deltaMetres`, `reasonCode`, `eventTimestamp`, optional `correctedLatitude`/`correctedLongitude`) — §5.4's implementation should use them.
+- **Decision rule in the report:** the highest-recall threshold on the "prior tiers missed" slice, with the door-number guard (embeddings can't tell #31 from #32), whose precision is ≥ 99.5 % over ≥ 20 calls; otherwise "do not wire in".
+- **Not done here:** provisioning the Vertex AI connection (GCP infra), running it, and any change to `save.py` — wiring a matcher into `_geocode()` is a separate flag-gated change after the report is reviewed.
 
 ### 5.6 Configuration & feature flags — **implemented**
 
