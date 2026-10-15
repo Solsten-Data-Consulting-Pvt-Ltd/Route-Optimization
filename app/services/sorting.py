@@ -4,6 +4,7 @@ import logging
 from collections import defaultdict
 
 from app.db.bigquery import (
+    deactivate_duplicate_routing_rows,
     fetch_active_rows_for_drs,
     fetch_assigned_rows_for_drs,
     write_group_assignments,
@@ -110,6 +111,12 @@ def compute_groups_and_sequence(rows, drs_no, start_meta):
 
 def run_sorting_pipeline(drs_no):
     start_meta = get_drs_starting_point(drs_no)
+    # Heal a DRS that already has duplicate rows for one consignment (they each
+    # claim a stop number). Best-effort: the fetch below ignores duplicates too.
+    try:
+        deactivate_duplicate_routing_rows(drs_no=drs_no)
+    except Exception:
+        logger.exception("Failed to deactivate duplicate routing rows for DRS %s", drs_no)
     rows = fetch_active_rows_for_drs(drs_no)
 
     if not rows:

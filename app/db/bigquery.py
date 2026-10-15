@@ -164,6 +164,17 @@ def merge_routing_rows(rows):
             logger.error("Failed batch consignmentIds: %s", [r["consignmentId"] for r in batch])
             raise
 
+    # Two saves of the same consignment can overlap and both INSERT (BigQuery has
+    # no unique constraint, and MERGE's NOT MATCHED check can't see a concurrent
+    # statement's insert). Collapse any such duplicates right away. Best-effort:
+    # the sort pipeline repeats this, and its reads ignore duplicates anyway.
+    try:
+        deactivate_duplicate_routing_rows(
+            pairs=[(r["consignmentId"], r["drsNo"]) for r in rows]
+        )
+    except Exception:
+        logger.exception("Failed to deactivate duplicate routing rows")
+
 
 def fetch_rows_by_consignment_ids(consignment_ids):
     """Unscoped by drsNo — kept for callers that genuinely want every row a
@@ -268,6 +279,63 @@ def deactivate_stale_routing_rows(pairs):
     get_bq_client().query(query, job_config=job_config).result()
 
 
+def deactivate_duplicate_routing_rows(pairs=None, drs_no=None):
+    """Keep ONE active row per (consignmentId, drsNo); mark the rest
+    is_active = FALSE (the earliest-created row is kept).
+
+    Scope it with `pairs` (the (consignmentId, drsNo) pairs a save just merged)
+    or with `drs_no` (every row of one DRS — used before optimizing, so a DRS
+    that already has duplicates heals itself on the next Optimize). Rows are
+    only deactivated, never deleted, so nothing is lost.
+    """
+    params = []
+    if pairs is not None:
+        deduped = _deduped_pairs(pairs)
+        if not deduped:
+            return
+
+        def scope(alias):
+            return f"""EXISTS (
+                SELECT 1 FROM UNNEST(@pairs) AS p
+                WHERE p.consignmentId = {alias}.consignmentId AND p.drsNo = {alias}.drsNo
+            )"""
+
+        params.append(
+            bigquery.ArrayQueryParameter(
+                "pairs", "STRUCT", [_pair_struct_param(cid, drs) for cid, drs in deduped]
+            )
+        )
+    elif drs_no:
+        def scope(alias):
+            return f"{alias}.drsNo = @drs_no"
+
+        params.append(bigquery.ScalarQueryParameter("drs_no", "STRING", drs_no))
+    else:
+        return
+
+    query = f"""
+        UPDATE `{TABLE_REF}` AS T
+        SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP()
+        WHERE T.is_active IS TRUE
+          AND {scope("T")}
+          AND T.sorting_id IN (
+              SELECT sorting_id FROM (
+                  SELECT D.sorting_id,
+                         ROW_NUMBER() OVER (
+                             PARTITION BY D.consignmentId, D.drsNo
+                             ORDER BY D.created_at, D.sorting_id
+                         ) AS rn
+                  FROM `{TABLE_REF}` AS D
+                  WHERE D.is_active IS TRUE AND {scope("D")}
+              )
+              WHERE rn > 1
+          )
+    """
+    get_bq_client().query(
+        query, job_config=bigquery.QueryJobConfig(query_parameters=params)
+    ).result()
+
+
 def fetch_active_rows_for_drs(drs_no):
     """Fetch every active consignment for this DRS — the whole DRS gets
     re-optimized on each run, not just newly-added/unassigned rows. Joined to
@@ -293,6 +361,12 @@ def fetch_active_rows_for_drs(drs_no):
             AND C.consignmentId = S.consignmentId
         WHERE C.is_active IS TRUE
           AND C.drsNo = @drs_no
+        -- One row per consignment. Duplicate active rows (from overlapping
+        -- saves) would each get their own stop number, so a DRS with 2 parcels
+        -- came out numbered 2 and 4. Keep the original (earliest) row.
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY C.consignmentId ORDER BY C.created_at, C.sorting_id
+        ) = 1
         ORDER BY C.planned_sequence_order;
     """
     job_config = bigquery.QueryJobConfig(
@@ -307,6 +381,12 @@ def fetch_assigned_rows_for_drs(drs_no):
     query = f"""
         SELECT * FROM `{TABLE_REF}`
         WHERE geohash_group_id != 'UNASSIGNED' AND drsNo = @drs_no
+        -- The Firestore routing doc is keyed on consignmentId alone, so with
+        -- several rows for one consignment whichever came back last silently
+        -- won. Prefer the active row, then the most recently updated.
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY consignmentId ORDER BY is_active DESC, updated_at DESC, sorting_id
+        ) = 1
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("drs_no", "STRING", drs_no)]
