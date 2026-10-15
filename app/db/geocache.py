@@ -70,6 +70,7 @@ from typing import Optional, Tuple
 
 from rapidfuzz import fuzz, process, utils
 
+from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore
 
 from app.config import GEOCODE_CACHE_FUZZY_THRESHOLD, GEOCODE_CACHE_SNAPSHOT_TTL_SECONDS
@@ -421,6 +422,24 @@ def save_to_cache(
         doc_ref.update({**payload, **group_update})
         return
 
+    # An entry with this exact normalized text may live under a DIFFERENT id: a
+    # legacy auto-id doc from before entries were hash-keyed, or one written
+    # under the spelling rules of its day. Update that one instead of adding a
+    # second doc for the same text. (Any verified state, unlike _exact_lookup.)
+    same_text = list(
+        _collection()
+        .where("address_normalized", "==", normalized)
+        .limit(1)
+        .stream()
+    )
+    if same_text:
+        text_payload = {
+            k: v for k, v in payload.items()
+            if k not in ("address_normalized", "address_raw", "geocode_address_raw")
+        }
+        same_text[0].reference.update({**text_payload, **group_update})
+        return
+
     # This exact spelling has no doc of its own - but it may already be a
     # recorded VARIANT of another doc (absorbed there under a drs_memo_group
     # by an earlier write, possibly one this call has no group for - e.g. a
@@ -443,17 +462,23 @@ def save_to_cache(
         variant_matches[0].reference.update({**sibling_payload, **group_update})
         return
 
-    doc_ref.set({
-        **payload,
-        **({"drs_memo_group": drs_memo_group, "drs_memo_groups": [drs_memo_group]}
-           if drs_memo_group else {}),
-        "address_normalized_variants": [normalized],
-        "verified": False,
-        "verified_by": None,
-        "verified_at": None,
-        "hit_count": 0,
-        "created_at": firestore.SERVER_TIMESTAMP,
-    })
+    # create() (not set()): if another request wrote this same id after the
+    # exists() check above, set() would replace that doc wholesale and reset its
+    # verified flag and hit_count. create() refuses, and we refresh it instead.
+    try:
+        doc_ref.create({
+            **payload,
+            **({"drs_memo_group": drs_memo_group, "drs_memo_groups": [drs_memo_group]}
+               if drs_memo_group else {}),
+            "address_normalized_variants": [normalized],
+            "verified": False,
+            "verified_by": None,
+            "verified_at": None,
+            "hit_count": 0,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+    except AlreadyExists:
+        doc_ref.update({**payload, **group_update})
 
 
 def verify_cache_group(drs_memo_group: str, verified_by: str) -> int:

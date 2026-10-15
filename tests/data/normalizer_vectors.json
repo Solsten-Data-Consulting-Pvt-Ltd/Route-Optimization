@@ -1,0 +1,135 @@
+{
+  "_note": "Shared by Route-Optimization (tests/data/normalizer_vectors.json) and 3PL-Management-Suite (functions/src/helpers/normalizerVectors.json). Keep the two files identical. Expected values come from app/db/geocache.py::normalize_address / cache_key.",
+  "vectors": [
+    {
+      "input": "No 5, HSR Layout, 560102, Bengaluru, Karnataka",
+      "normalized": "no 5 hsr layout bengaluru karnataka",
+      "cache_key": "6e6a4a837d49ef6aca24ae298d4183d01ccff343"
+    },
+    {
+      "input": "12 Main Rd 560035 Sarjapura Bengaluru",
+      "normalized": "12 main rd sarjapura bengaluru",
+      "cache_key": "cf327f9edac76350b84d85c41e767dffc5943b1f"
+    },
+    {
+      "input": "Flat 4B, Sarjapur Main Road, Bangalore 560102",
+      "normalized": "flat 4b sarjapura main road bengaluru",
+      "cache_key": "66b96fc21a319b99af2a13f445c96f051db68889"
+    },
+    {
+      "input": "221 Amblipura, Bangalore",
+      "normalized": "221 ambalipura bengaluru",
+      "cache_key": "2c624a478efbbd6d07c4eb384eb8a8540adc1cf3"
+    },
+    {
+      "input": "Ambaipura, Belandur Gate, Benglore 560102",
+      "normalized": "ambalipura bellandur gate bengaluru",
+      "cache_key": "a5be7a91b67a7811ef634ec64a3144edd2bedc28"
+    },
+    {
+      "input": "Ilandur Road, Kasarjpura, Bangalore",
+      "normalized": "bellandur road sarjapura bengaluru",
+      "cache_key": "20f2ad4a49ee95fd1db52ca4ab76d4327768666b"
+    },
+    {
+      "input": "bangalorebangalore road",
+      "normalized": "bangalorebangalore road",
+      "cache_key": "5493ece2dbc4248ac112533f394631609c37eea6"
+    },
+    {
+      "input": "  Shop 9,, Ambalipura\tLake Rd,\nBANGALORE  560103 ",
+      "normalized": "shop 9 ambalipura lake rd bengaluru",
+      "cache_key": "d2d7d76e7f1f2efde9705eec283a73ab2a2039c5"
+    },
+    {
+      "input": "R K Complex, Dommasandra, Bangalore 562125",
+      "normalized": "rk com dommasandra bengaluru",
+      "cache_key": "d80746b1574cf333df09b1c7477dd8beba22f311"
+    },
+    {
+      "input": "RK Com, Domasandra, Bengaluru 562125",
+      "normalized": "rk com dommasandra bengaluru",
+      "cache_key": "d80746b1574cf333df09b1c7477dd8beba22f311"
+    },
+    {
+      "input": "mydomasandra road",
+      "normalized": "mydommasandra road",
+      "cache_key": "f9681e8029a51596de749e2b8129b27333921eb3"
+    },
+    {
+      "input": "Unit 17A, 18 / 2A Sarjapur Road, Bangalore 560102, India",
+      "normalized": "unit 17a 18/2a sarjapura road bengaluru india",
+      "cache_key": "347b32a9748dca5858979af4b0c03a630e01b9d3"
+    },
+    {
+      "input": "18/2a Sarjapur Road",
+      "normalized": "18/2a sarjapura road",
+      "cache_key": "3c0a6b02798e7fa824e1a98acda320b3f25cd285"
+    },
+    {
+      "input": "VPMX+F5R, Sarjapur, Bangalore 560035",
+      "normalized": "sarjapura bengaluru",
+      "cache_key": "a0f53d2c39eb11e695e3ecca8af9152cced06aba"
+    },
+    {
+      "input": "9F2X+4C Whitefield Bangalore",
+      "normalized": "whitefield bengaluru",
+      "cache_key": "764259141f75f99a54931fed06554adfdea1bcb9"
+    },
+    {
+      "input": "ABC Exports Pvt. Ltd., Whitefield, Bangalore",
+      "normalized": "abc export pvt ltd whitefield bengaluru",
+      "cache_key": "a978b7f8577c13662cec290829aa7f5d4215676b"
+    },
+    {
+      "input": "ABC Exports Private Limited Whitefield",
+      "normalized": "abc export pvt ltd whitefield",
+      "cache_key": "b54ed495fc3614456589c59c76b7795d39a55b16"
+    },
+    {
+      "input": "ABC Export [P] Ltd Whitefield",
+      "normalized": "abc export pvt ltd whitefield",
+      "cache_key": "b54ed495fc3614456589c59c76b7795d39a55b16"
+    },
+    {
+      "input": "XYZ Enterprises (P) Ltd., Hoskote",
+      "normalized": "xyz enterprise pvt ltd hoskote",
+      "cache_key": "3962e58e932376dbfc286887bc7256bd2259ec51"
+    },
+    {
+      "input": "Sunrise Industries Limited, Hosur Road, Bangalore",
+      "normalized": "sunrise industry ltd hosur road bengaluru",
+      "cache_key": "5d9eb24b0c6b8947e64b4140c110c3a9952d0709"
+    },
+    {
+      "input": "Imports House, MG Road, Bangalore 560001",
+      "normalized": "import house mg road bengaluru",
+      "cache_key": "2337a3df9d64fc8229c5b8a4e9b070539530d627"
+    },
+    {
+      "input": "",
+      "normalized": "",
+      "cache_key": null
+    },
+    {
+      "input": "   ",
+      "normalized": "",
+      "cache_key": null
+    },
+    {
+      "input": "560001",
+      "normalized": "",
+      "cache_key": null
+    },
+    {
+      "input": "Maple Court Ittangur, Bengaluru, Karnataka 562125, India",
+      "normalized": "maple court ittangur bengaluru karnataka india",
+      "cache_key": "45023dd39c3d1e7e3e6cebf533ee69731fdfc83a"
+    },
+    {
+      "input": "Orchid Meadows, Dommasandra, Bengaluru, Karnataka 562125, India",
+      "normalized": "orchid meadows dommasandra bengaluru karnataka india",
+      "cache_key": "5ef72a4a7433f88ee5d562afa38bda7156b9afc1"
+    }
+  ]
+}

@@ -17,6 +17,7 @@ os.environ.setdefault("BQ_TABLE", "test_table")
 os.environ.setdefault("BQ_STRUCTURED_TABLE", "test_structured_table")
 os.environ.setdefault("FIRESTORE_PROJECT", "test-project")
 
+from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore
 from google.cloud.firestore_v1.transforms import ArrayUnion
 
@@ -54,6 +55,12 @@ class FakeRef:
     def set(self, fields):
         self.store.docs[self.id] = {}
         _apply(self.store.docs[self.id], fields)
+
+    def create(self, fields):
+        # Real Firestore create(): refuses when the id already exists.
+        if self.id in self.store.docs:
+            raise AlreadyExists("document already exists")
+        self.set(fields)
 
     def update(self, fields):
         _apply(self.store.docs[self.id], fields)
@@ -166,3 +173,67 @@ class GroupTagTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CreateOnlyTests(unittest.TestCase):
+    """Saving must never overwrite or double an entry that is already there."""
+
+    def setUp(self):
+        self.col = FakeCollection()
+        client = type("C", (), {"batch": staticmethod(FakeBatch)})
+        self.patches = [
+            patch.object(geocache, "_collection", lambda: self.col),
+            patch.object(geocache, "get_fs_client", lambda: client),
+        ]
+        for p in self.patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self.patches])
+
+    def test_a_doc_written_in_the_gap_is_refreshed_not_overwritten(self):
+        # Another request creates the same id after our exists() check but
+        # before our create(): simulate by making the first get() report "missing".
+        addr = "12 MG Road, Bengaluru 560001"
+        doc_id = geocache.cache_key(geocache.normalize_address(addr))
+        self.col.docs[doc_id] = {"verified": True, "hit_count": 7, "latitude": 1.0}
+
+        real_get = FakeRef.get
+        calls = {"n": 0}
+
+        def missing_once(ref):
+            calls["n"] += 1
+            snap = real_get(ref)
+            if calls["n"] == 1:
+                snap.exists = False
+            return snap
+
+        with patch.object(FakeRef, "get", missing_once), \
+             patch.object(geocache, "_docs_by_group", lambda g: []):
+            geocache.save_to_cache(addr, RESULT, lookup_address=addr)
+
+        doc = self.col.docs[doc_id]
+        self.assertEqual(len(self.col.docs), 1)
+        self.assertTrue(doc["verified"])              # not reset
+        self.assertEqual(doc["hit_count"], 7)         # not reset
+        self.assertEqual(doc["latitude"], RESULT["latitude"])  # payload refreshed
+
+    def test_an_entry_with_the_same_text_under_another_id_is_updated_not_doubled(self):
+        addr = "12 MG Road, Bengaluru 560001"
+        normalized = geocache.normalize_address(addr)
+        self.col.docs["legacyAutoId123"] = {
+            "address_normalized": normalized, "verified": True, "hit_count": 4,
+        }
+        geocache.save_to_cache(addr, RESULT, lookup_address=addr)
+
+        self.assertEqual(list(self.col.docs), ["legacyAutoId123"])   # no second doc
+        self.assertTrue(self.col.docs["legacyAutoId123"]["verified"])
+        self.assertEqual(self.col.docs["legacyAutoId123"]["hit_count"], 4)
+        self.assertEqual(self.col.docs["legacyAutoId123"]["latitude"], RESULT["latitude"])
+
+    def test_a_brand_new_address_still_creates_one_unverified_doc(self):
+        addr = "77 Park Avenue, Bengaluru 560002"
+        geocache.save_to_cache(addr, RESULT, lookup_address=addr)
+        self.assertEqual(len(self.col.docs), 1)
+        doc = next(iter(self.col.docs.values()))
+        self.assertFalse(doc["verified"])
+        self.assertEqual(doc["hit_count"], 0)
+
