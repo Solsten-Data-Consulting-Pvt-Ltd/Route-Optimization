@@ -31,6 +31,8 @@ def _apply(doc, fields):
             doc[k] = cur + [x for x in v.values if x not in cur]
         elif v is firestore.SERVER_TIMESTAMP:
             doc[k] = "ts"
+        elif v is firestore.DELETE_FIELD:
+            doc.pop(k, None)
         else:
             doc[k] = v
 
@@ -169,6 +171,55 @@ class GroupTagTests(unittest.TestCase):
         self.assertTrue(all(n <= 500 for n in commits))
         self.assertEqual(sum(commits), 1100)
         self.assertTrue(all(d["verified"] for d in self.col.docs.values()))
+
+
+class UnverifiedExpiryTests(unittest.TestCase):
+    """Unverified docs carry `expire_at` (Firestore TTL); verified docs never do."""
+
+    def setUp(self):
+        self.col = FakeCollection()
+        client = type("C", (), {"batch": staticmethod(FakeBatch)})
+        self.patches = [
+            patch.object(geocache, "_collection", lambda: self.col),
+            patch.object(geocache, "get_fs_client", lambda: client),
+        ]
+        for p in self.patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self.patches])
+
+    def test_new_unverified_doc_gets_expire_at_three_days_out(self):
+        from datetime import datetime, timedelta, timezone
+        addr = "77 Park Avenue, Bengaluru 560002"
+        geocache.save_to_cache(addr, RESULT, lookup_address=addr)
+        doc = next(iter(self.col.docs.values()))
+        delta = doc["expire_at"] - datetime.now(timezone.utc)
+        self.assertTrue(timedelta(days=2, hours=23) < delta <= timedelta(days=3))
+
+    def test_rewriting_an_unverified_doc_pushes_expire_at_out(self):
+        addr = "77 Park Avenue, Bengaluru 560002"
+        geocache.save_to_cache(addr, RESULT, lookup_address=addr)
+        doc = next(iter(self.col.docs.values()))
+        from datetime import datetime, timedelta, timezone
+        doc["expire_at"] = datetime.now(timezone.utc) - timedelta(days=1)  # nearly gone
+        geocache.save_to_cache(addr, RESULT, lookup_address=addr)
+        self.assertEqual(len(self.col.docs), 1)               # still no duplicate
+        self.assertGreater(doc["expire_at"], datetime.now(timezone.utc) + timedelta(days=2))
+
+    def test_writing_to_a_verified_doc_never_adds_expire_at(self):
+        addr = "12 MG Road, Bengaluru 560001"
+        doc_id = geocache.cache_key(geocache.normalize_address(addr))
+        self.col.docs[doc_id] = {"verified": True, "hit_count": 3}
+        geocache.save_to_cache(addr, RESULT, lookup_address=addr)
+        self.assertNotIn("expire_at", self.col.docs[doc_id])
+
+    def test_verifying_removes_expire_at(self):
+        addr = "77 Park Avenue, Bengaluru 560002"
+        geocache.save_to_cache(addr, RESULT, lookup_address=addr, drs_memo_group=GROUP_A)
+        self.assertIn("expire_at", next(iter(self.col.docs.values())))
+        geocache.verify_cache_group(GROUP_A, "exec1")
+        doc = next(iter(self.col.docs.values()))
+        self.assertTrue(doc["verified"])
+        self.assertNotIn("expire_at", doc)
 
 
 if __name__ == "__main__":

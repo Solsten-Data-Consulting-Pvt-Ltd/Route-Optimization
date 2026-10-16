@@ -66,6 +66,7 @@ import hashlib
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from rapidfuzz import fuzz, process, utils
@@ -73,7 +74,11 @@ from rapidfuzz import fuzz, process, utils
 from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore
 
-from app.config import GEOCODE_CACHE_FUZZY_THRESHOLD, GEOCODE_CACHE_SNAPSHOT_TTL_SECONDS
+from app.config import (
+    GEOCODE_CACHE_FUZZY_THRESHOLD,
+    GEOCODE_CACHE_SNAPSHOT_TTL_SECONDS,
+    GEOCODE_CACHE_UNVERIFIED_TTL_DAYS,
+)
 from app.db.clients import get_fs_client
 
 logger = logging.getLogger(__name__)
@@ -178,6 +183,23 @@ def cache_key(normalized: str) -> str:
 
 def _collection():
     return get_fs_client().collection(GEOCODE_CACHE_COLLECTION)
+
+
+def _expiry_fields(existing: Optional[dict] = None) -> dict:
+    """`expire_at` for an UNVERIFIED doc; {} when the existing doc is verified.
+
+    A Firestore TTL policy on `expire_at` deletes unverified entries that nobody
+    verified (e.g. a test DRS that was never delivered). The deadline is pushed
+    out on every write, so an address that keeps coming back stays alive.
+    Verified docs never carry `expire_at` (verify_cache_group removes it), and
+    a write to an already-verified doc must not add one back.
+    """
+    if existing and existing.get("verified"):
+        return {}
+    return {
+        "expire_at": datetime.now(timezone.utc)
+        + timedelta(days=GEOCODE_CACHE_UNVERIFIED_TTL_DAYS)
+    }
 
 
 def _verified_entries():
@@ -411,6 +433,7 @@ def save_to_cache(
             siblings[0].reference.update({
                 **sibling_payload,
                 **group_update,
+                **_expiry_fields(siblings[0].to_dict()),
                 "address_normalized_variants": firestore.ArrayUnion([normalized]),
             })
             return
@@ -418,8 +441,9 @@ def save_to_cache(
     doc_ref = _collection().document(cache_key(normalized))
     # An existing entry keeps its ops verdict and hit count; only the geocode
     # payload is refreshed.
-    if doc_ref.get().exists:
-        doc_ref.update({**payload, **group_update})
+    existing = doc_ref.get()
+    if existing.exists:
+        doc_ref.update({**payload, **group_update, **_expiry_fields(existing.to_dict())})
         return
 
     # An entry with this exact normalized text may live under a DIFFERENT id: a
@@ -437,7 +461,9 @@ def save_to_cache(
             k: v for k, v in payload.items()
             if k not in ("address_normalized", "address_raw", "geocode_address_raw")
         }
-        same_text[0].reference.update({**text_payload, **group_update})
+        same_text[0].reference.update(
+            {**text_payload, **group_update, **_expiry_fields(same_text[0].to_dict())}
+        )
         return
 
     # This exact spelling has no doc of its own - but it may already be a
@@ -459,7 +485,9 @@ def save_to_cache(
             k: v for k, v in payload.items()
             if k not in ("address_normalized", "address_raw", "geocode_address_raw")
         }
-        variant_matches[0].reference.update({**sibling_payload, **group_update})
+        variant_matches[0].reference.update(
+            {**sibling_payload, **group_update, **_expiry_fields(variant_matches[0].to_dict())}
+        )
         return
 
     # create() (not set()): if another request wrote this same id after the
@@ -476,9 +504,10 @@ def save_to_cache(
             "verified_at": None,
             "hit_count": 0,
             "created_at": firestore.SERVER_TIMESTAMP,
+            **_expiry_fields(),
         })
     except AlreadyExists:
-        doc_ref.update({**payload, **group_update})
+        doc_ref.update({**payload, **group_update, **_expiry_fields(doc_ref.get().to_dict())})
 
 
 def verify_cache_group(drs_memo_group: str, verified_by: str) -> int:
@@ -502,6 +531,7 @@ def verify_cache_group(drs_memo_group: str, verified_by: str) -> int:
                 "verified": True,
                 "verified_by": verified_by,
                 "verified_at": firestore.SERVER_TIMESTAMP,
+                "expire_at": firestore.DELETE_FIELD,   # verified docs never expire
             })
         batch.commit()
     invalidate_snapshot()

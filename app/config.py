@@ -15,6 +15,10 @@ GEOCODING_SOURCE = "google_places_api"
 
 GEOCODE_CACHE_FUZZY_THRESHOLD = 85
 GEOCODE_CACHE_SNAPSHOT_TTL_SECONDS = 300
+# Unverified geocode_cache docs (never verified by an executive, so never served)
+# auto-delete this many days after their last write, via a Firestore TTL policy
+# on `expire_at`. Verified docs have no `expire_at` and are never deleted.
+GEOCODE_CACHE_UNVERIFIED_TTL_DAYS = 3
 
 # DRS address memo: reuse a pin for same-place consignments within one DRS.
 DRS_MEMO_COLLECTION = "drs_address_memo"
