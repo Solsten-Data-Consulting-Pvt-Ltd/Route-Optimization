@@ -6,3 +6,6 @@ venv/
 env-vars.yaml
 .cache/
 desktop.ini
+
+# Claude Code per-user settings
+.claude/settings.local.json

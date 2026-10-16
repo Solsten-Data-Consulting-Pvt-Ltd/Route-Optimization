@@ -8,3 +8,8 @@ env-vars.yaml
 venv/
 node_modules/
 desktop.ini
+
+# Spec Kit / AI agent tooling (not needed by the service)
+.specify/
+.claude/
+specs/

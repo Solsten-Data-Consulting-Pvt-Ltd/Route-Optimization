@@ -639,6 +639,34 @@ high enough (e.g. 300000 ms), matching the Cloud Run timeout of 300 seconds.
 
 ---
 
+## Spec-driven development (Spec Kit)
+
+The repo is set up with [GitHub Spec Kit](https://github.com/github/spec-kit)
+for Claude Code. It is development tooling only: `.specify/`, `.claude/` and
+`specs/` are not copied into the container, and `.gcloudignore` keeps them out
+of the Cloud Run source upload.
+
+- **Rules**: [`.specify/memory/constitution.md`](./.specify/memory/constitution.md)
+  holds the principles every change is checked against (frozen delivered stops,
+  `verified: false` on new geocodes, test-backed changes, and so on).
+- **Flow for a new feature** (in Claude Code, on a branch off `dev`):
+  `/speckit-specify` → optional `/speckit-clarify` → `/speckit-plan` →
+  `/speckit-tasks` → optional `/speckit-analyze` → `/speckit-implement`.
+  Each feature gets a `specs/NNN-feature/` folder, which is committed with the
+  code.
+- **Helper scripts** are PowerShell (`.specify/scripts/powershell/`). Small bug
+  fixes do not need a spec.
+
+To refresh the templates later, install [uv](https://docs.astral.sh/uv/) and
+run the following from the repo root on a branch, then review the diff
+(especially `constitution.md`) before committing.
+
+```powershell
+uvx --from git+https://github.com/github/spec-kit.git specify init --here --integration claude --script ps
+```
+
+---
+
 ## Known rough edges
 
 Worth knowing before you debug something surprising:
