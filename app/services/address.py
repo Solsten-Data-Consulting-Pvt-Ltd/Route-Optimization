@@ -57,25 +57,14 @@ def extract_pincode(address: str):
 
 
 def build_geocode_address(receiver_name: str, receiver_address: str) -> str:
-    """Build address for geocoding WITHOUT destroying structure.
+    """Build the Places query: the receiver address only, structure intact.
 
-    Google's API handles various formats well, so the receiver name is simply
-    prefixed as a business name when it is not already part of the address.
+    OCR now splits the human recipient name from the business/organization,
+    and `receiver_name` is a person's name. A personal name does not match a
+    place in Google Places and can skew or empty the result, so it is no
+    longer prefixed. `receiver_name` stays in the signature for callers.
     """
-    name = str(receiver_name or "").strip()
-    addr = str(receiver_address or "").strip()
-
-    if not addr and not name:
-        return ""
-
-    # If both exist and name is NOT already in address, add it as business name
-    if name and addr:
-        # Check if name is already in address (case insensitive)
-        if name.lower() in addr.lower():
-            return addr
-        return f"{name}, {addr}"
-
-    return addr or name
+    return str(receiver_address or "").strip()
 
 
 # Unit-level tokens that often make Places return nothing ("Flat 3B, 2nd

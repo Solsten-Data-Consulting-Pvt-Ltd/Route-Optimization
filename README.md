@@ -21,8 +21,8 @@ You give it a list of consignment IDs. For each one it:
 
 1. Reads the consignment document from Firestore (`consignments`) to get the
    receiver name and address.
-2. Cleans the address into one single line, and joins name + address into one
-   search string.
+2. Cleans the address into one single line and uses it as the search string
+   (the receiver name is not added; it is a person's name).
 3. Looks that address up in the **geocode cache** (Firestore `geocode_cache`).
    If the same (or a very similar) address was geocoded before *and* an ops
    person marked it `verified`, it reuses that answer and skips the API call.

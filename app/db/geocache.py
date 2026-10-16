@@ -41,10 +41,10 @@ Three improvements over the original port:
 
   Fix 1 — Address-only cache lookup key.
      `get_cached_geocode` and `save_to_cache` now accept an optional
-     `lookup_address` parameter (the raw receiver address without the
-     receiver name prefix).  Cache lookup and the Firestore document key both
+     `lookup_address` parameter (the raw receiver address; the geocode
+     string is now address-only too).  Cache lookup and the Firestore document key both
      use the normalized form of `lookup_address` when it is provided.  The
-     full `geocode_address` (name + address) is still sent to the Places API
+     full `geocode_address` (now address-only) is still sent to the Places API
      and stored as `geocode_address_raw` for traceability, but the cache key
      is keyed on location only.  This means two consignments for different
      people at the same building (e.g. different employees at Shahi Exports)
@@ -275,7 +275,7 @@ def get_cached_geocode_with_outcome(
     name prefix.  When provided, the cache lookup key is derived from
     `lookup_address` so that deliveries to the same building for different
     recipients (e.g. different employees at Shahi Exports) still get a hit.
-    `address` (full geocode string: name + address) is only used to recompute
+    `address` (full geocode string) is only used to recompute
     `pincode_match` on a hit and is not used as the lookup key.
 
     If `lookup_address` is omitted the behaviour is identical to before.
@@ -371,7 +371,7 @@ def save_to_cache(
     payload["types"] = payload.get("types") or []
     payload["partial_match"] = bool(payload.get("partial_match"))
     payload.update({
-        "address_raw":         address,     # full geocode string (name + address)
+        "address_raw":         address,     # full geocode string (address-only)
         "geocode_address_raw": address,     # alias kept for clarity
         "address_normalized":  normalized,  # Fix 1: keyed on location only
         "source": source,

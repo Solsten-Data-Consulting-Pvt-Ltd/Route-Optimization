@@ -20,13 +20,11 @@ class AddressTests(unittest.TestCase):
         self.assertEqual(extract_pincode("Kodathi, Bengaluru, Karnataka 560035"), "560035")
         self.assertIsNone(extract_pincode("Kodathi, Bengaluru"))
 
-    def test_builds_geocode_address_without_duplicate_name(self):
-        address = "Twachaa Pharmacy, Domasandra Circle, 562125"
+    def test_geocode_address_is_address_only(self):
+        address = "Domasandra Circle, 562125"
+        self.assertEqual(build_geocode_address("Ravi Kumar", address), address)
         self.assertEqual(build_geocode_address("Twachaa Pharmacy", address), address)
-        self.assertEqual(
-            build_geocode_address("Twachaa Pharmacy", "Domasandra Circle, 562125"),
-            "Twachaa Pharmacy, Domasandra Circle, 562125",
-        )
+        self.assertEqual(build_geocode_address("Ravi Kumar", ""), "")
 
     def test_cleans_obvious_separator_noise(self):
         self.assertEqual(

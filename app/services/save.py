@@ -559,7 +559,7 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
 
         if not geocode_address_str:
             drs_metrics["invalidAddresses"] += 1
-            reason = "Receiver address and name are both missing."
+            reason = "Receiver address is missing."
             failures.append({"consignmentId": consignment_id, "reason": reason})
             rows_to_merge.append(_failed_row(
                 drs_no, drs_id, driver_numeric_id, consignment_id,
