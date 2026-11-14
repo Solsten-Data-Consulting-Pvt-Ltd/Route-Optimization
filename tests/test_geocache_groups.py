@@ -288,3 +288,14 @@ class CreateOnlyTests(unittest.TestCase):
         self.assertFalse(doc["verified"])
         self.assertEqual(doc["hit_count"], 0)
 
+    def test_same_place_id_nearby_reuses_one_owner_and_records_variant(self):
+        first_address = "12 First Cross, Bengaluru 560001"
+        second_address = "12 First Cross Road, Bangalore 560001"
+        first_id = geocache.save_to_cache(first_address, RESULT, lookup_address=first_address)
+        second_id = geocache.save_to_cache(second_address, RESULT, lookup_address=second_address)
+
+        self.assertEqual(first_id, second_id)
+        self.assertEqual(len(self.col.docs), 1)
+        doc = self.col.docs[first_id]
+        self.assertIn(geocache.normalize_address(second_address), doc["address_normalized_variants"])
+

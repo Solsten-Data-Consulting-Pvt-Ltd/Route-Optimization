@@ -55,11 +55,12 @@ def run_save(docs, *, use_v2, confirmed=None, cache=(None, "miss"),
          patch.object(save_mod, "deactivate_stale_routing_rows"), \
          patch.object(save_mod, "fetch_rows_by_consignment_drs_pairs", return_value=[]), \
          patch.object(save_mod, "upsert_consignments_routing"), \
+         patch.object(save_mod, "set_routing_cache_metadata") as cache_metadata, \
          patch.object(save_mod, "write_drs_cache_metrics"):
         result = save_mod.save_consignments_pipeline([d.id for d in docs],
                                                      confirmed_locations=confirmed)
     rows = {r["consignmentId"]: r for r in merge.call_args.args[0]}
-    return result, rows, {"classified": pc, "legacy": pa}
+    return result, rows, {"classified": pc, "legacy": pa, "cache_metadata": cache_metadata}
 
 
 def triple(row):
@@ -138,6 +139,14 @@ class CacheTierTests(unittest.TestCase):
         _, rows, _ = run_save([_Doc("C1")], use_v2=True,
                               cache=(pin("560037", False), "exact_hit"))
         self.assertEqual(triple(rows["C1"]), ("needs_review", "PINCODE_MISMATCH", "cache_exact"))
+
+    def test_cache_owner_id_is_published_to_the_routing_document(self):
+        _, _rows, mocks = run_save(
+            [_Doc("C1")], use_v2=True, cache=(pin(), "exact_hit", "cache-1"),
+        )
+        mocks["cache_metadata"].assert_called_once_with({
+            "C1": {"cache_id": "cache-1", "person_corrected": False},
+        })
 
 
 class ConfirmedLocationTests(unittest.TestCase):
