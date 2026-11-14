@@ -138,6 +138,17 @@ class CacheVerificationTests(unittest.TestCase):
         cache_verify.restore({"id": "new-cache", "created": True, "entry": {}})
         self.assertNotIn("new-cache", self.client._docs["geocode_cache"])
 
+    def test_restore_accepts_a_pre_switchover_flattened_payload(self):
+        self.entry["observations"] = [observation("D1")]
+        cache_verify.restore({
+            "id": "cache-1", "created": False,
+            "latitude": 11.0, "longitude": 76.0, "verified": False,
+            "source": "api", "verified_by": None,
+        })
+        self.assertEqual((self.entry["latitude"], self.entry["longitude"]), (11.0, 76.0))
+        self.assertFalse(self.entry["verified"])
+        self.assertIn("observations", self.entry)
+
 
 if __name__ == "__main__":
     unittest.main()

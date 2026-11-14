@@ -284,8 +284,22 @@ def restore(previous):
         ref.delete()
     else:
         entry = previous.get("entry")
-        if not isinstance(entry, dict):
-            raise ValueError("previous.entry is required")
-        ref.set(entry, merge=False)
+        if isinstance(entry, dict):
+            ref.set(entry, merge=False)
+        else:
+            # Flags written by the pre-Phase-3 3PL service held only the
+            # fields it used to mutate. Route their undo through the owner as
+            # well; merge keeps fields that old clients never knew about.
+            legacy_fields = {
+                key: previous[key]
+                for key in (
+                    "latitude", "longitude", "verified", "source",
+                    "verified_by", "verified_at", "updated_at",
+                )
+                if key in previous
+            }
+            if not legacy_fields:
+                raise ValueError("previous.entry is required")
+            ref.set(legacy_fields, merge=True)
     invalidate_snapshot()
     return {"id": cache_id, "restored": True}
