@@ -15,6 +15,7 @@ from app.db.bigquery import (
 from app.db.cache_metrics import write_drs_cache_metrics
 from app.db.firestore import (
     get_consignments_by_id,
+    set_routing_cache_metadata,
     set_routing_candidates,
     upsert_consignments_routing,
 )
@@ -134,11 +135,22 @@ def _components_of(receiver):
 
 
 def _unpack_geocode(res):
-    """_geocode's result as (result, reason, code, outcome, resolution, source).
-    Tolerates the older 4-value shape (resolution/source then None)."""
+    """Unpack modern or pre-cache-owner `_geocode` return values."""
     result, reason, code, outcome = res[:4]
     resolution, source = res[4] if len(res) > 4 and res[4] else (None, None)
-    return result, reason, code, outcome, resolution, source
+    cache_id = res[5] if len(res) > 5 else ((result or {}).get("_cache_id"))
+    return result, reason, code, outcome, resolution, source, cache_id
+
+
+def _unpack_cache_lookup(res):
+    """Cache lookup gained an id without breaking test/legacy call sites."""
+    result, outcome = res[:2]
+    return result, outcome, (res[2] if len(res) > 2 else None)
+
+
+def _cache_id(value):
+    """A cache id is always a non-empty Firestore document-id string."""
+    return value if isinstance(value, str) and value else None
 
 
 def _pincode_resolution(result, default):
@@ -173,6 +185,7 @@ def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignm
         classification = (_pincode_resolution(result, codes.CONFIDENT), codes.SOURCE_MEMO)
     logger.info("DRS memo hit (%s, source=%s) drs=%s for '%s'",
                 reason, entry.get("source"), drs_id, address[:80])
+    cache_id = entry.get("cache_id")
     _safe(drs_memo.link, drs_id, entry_id,
           lookup_address=lookup_address, consignment_id=consignment_id,
           phones=(match_info or {}).get("phones"))
@@ -184,8 +197,15 @@ def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignm
     # re-spelling of it is just a duplicate.
     if (lookup_address and lookup_address not in (entry.get("variants") or [])
             and entry.get("source") != drs_memo.SOURCE_GLOBAL_CACHE):
-        _safe(save_to_cache, address, result, lookup_address=lookup_address,
-              source="drs_memo", drs_memo_group=drs_memo.group_id(drs_id, entry_id))
+        saved_cache_id = _cache_id(_safe(
+            save_to_cache, address, result, lookup_address=lookup_address,
+            source="drs_memo", drs_memo_group=drs_memo.group_id(drs_id, entry_id),
+        ))
+        if saved_cache_id:
+            cache_id = saved_cache_id
+            _safe(drs_memo.link, drs_id, entry_id, cache_id=cache_id)
+    if cache_id:
+        result["_cache_id"] = cache_id
     return result, None, None, "drs_hit", classification
 
 
@@ -238,13 +258,16 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
 
     # 2. Verified global cache.
     try:
-        cached, cache_outcome = get_cached_geocode_with_outcome(
-            address, lookup_address=lookup_address
+        cached, cache_outcome, cache_id = _unpack_cache_lookup(
+            get_cached_geocode_with_outcome(
+                address, lookup_address=lookup_address, include_cache_id=True,
+            )
         )
     except Exception:
         logger.exception("Geocode cache read failed for '%s'", address[:80])
         cached = None
         cache_outcome = "cache_error"
+        cache_id = None
 
     if cached:
         logger.info("Geocode cache hit for '%s'", address[:80])
@@ -257,14 +280,16 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
             if memo_hit:
                 _safe(drs_memo.link, drs_id, memo_hit[0],
                       lookup_address=lookup_address, consignment_id=consignment_id,
-                      phones=(match_info or {}).get("phones"))
+                      phones=(match_info or {}).get("phones"), cache_id=cache_id)
             else:
                 _safe(drs_memo.remember, drs_id, match_info, cached,
                       drs_memo.SOURCE_GLOBAL_CACHE,
                       lookup_address=lookup_address, consignment_id=consignment_id,
-                      entries=memo_entries)
+                      cache_id=cache_id, entries=memo_entries)
         source = (codes.SOURCE_CACHE_EXACT if cache_outcome == "exact_hit"
                   else codes.SOURCE_CACHE_FUZZY)
+        if cache_id:
+            cached["_cache_id"] = cache_id
         return cached, None, None, cache_outcome, (
             _pincode_resolution(cached, codes.KNOWN_GOOD), source,
         )
@@ -288,27 +313,45 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
         source = codes.SOURCE_PLACES if geocode_result else None
 
     if geocode_result:
-        # Only persist to geocode_cache when there's a real DRS/memo context
-        # (use_memo). Without a drs_id there's no drs_memo_group to tag this
-        # row with, so it would sit forever as an untagged orphan - and once
-        # this same consignment is later actually added to a DRS and
-        # geocoded again through the memo-aware path (or a same-place
-        # sibling triggers the group first), that write can never find or
-        # fold in this earlier one, since geocode_cache has no phone/door
-        # number matching of its own - only exact/near-identical text. A
-        # preview before a consignment has a DRS just re-hits Places on
-        # every repeat instead of caching; that's the accepted trade-off.
+        # A pre-save preview with no consignment remains side-effect-free.
+        # Every real save, including a consignment that has not yet been put
+        # in a DRS, receives an owner cache id for routing/audit purposes.
         if use_memo:
+            # Another worker may have stored the same-place memo while this
+            # request was waiting on Places. Re-read before creating a cache
+            # entry, then reuse that authoritative pin rather than racing it.
+            try:
+                latest_entries = drs_memo.load_entries(drs_id)
+                late_hit = drs_memo.find_match(latest_entries, match_info)
+            except Exception:
+                logger.exception("DRS memo recheck failed for drs=%s", drs_id)
+                late_hit = None
+            if late_hit:
+                return _memo_hit(drs_id, *late_hit, address, lookup_address,
+                                 consignment_id, match_info=match_info)
             group = drs_memo.group_id(drs_id, match_info["entry_id"])
             try:
-                save_to_cache(address, geocode_result, lookup_address=lookup_address,
-                              drs_memo_group=group)
+                cache_id = _cache_id(save_to_cache(
+                    address, geocode_result, lookup_address=lookup_address,
+                    drs_memo_group=group,
+                ))
             except Exception:
                 logger.exception("Geocode cache write failed for '%s'", address[:80])
+                cache_id = None
             _safe(drs_memo.remember, drs_id, match_info, geocode_result, drs_memo.SOURCE_API,
                   lookup_address=lookup_address, consignment_id=consignment_id,
-                  entries=memo_entries)
+                  cache_id=cache_id, entries=memo_entries)
+        elif consignment_id:
+            try:
+                cache_id = _cache_id(save_to_cache(
+                    address, geocode_result, lookup_address=lookup_address,
+                ))
+            except Exception:
+                logger.exception("Geocode cache write failed for '%s'", address[:80])
+                cache_id = None
 
+    if geocode_result and cache_id:
+        geocode_result["_cache_id"] = cache_id
     return geocode_result, error_reason, error_code, cache_outcome, (resolution, source)
 
 
@@ -377,7 +420,7 @@ def preview_geocode(receiver_name, receiver_address, drs_id=None, consignment_id
         if use_v2 else None
     )
 
-    geocode_result, error_reason, error_code, _cache_outcome, resolution, source = _unpack_geocode(
+    geocode_result, error_reason, error_code, _cache_outcome, resolution, source, _cache_id = _unpack_geocode(
         _geocode(
             geocode_address_str, lookup_address=receiver_address or None,
             drs_id=memo_drs_id, match_info=match_info, consignment_id=consignment_id or None,
@@ -529,6 +572,10 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
     # consignmentId -> places Google offered for a doubtful pin (or None to
     # clear). Written to Firestore after the routing upsert below.
     candidates_by_cid = {}
+    # Firestore-only ownership metadata. This must be written before the
+    # ordinary routing upsert, because it reads the previous source to retain
+    # what a human correction replaced.
+    cache_metadata_by_cid = {}
     cache_metrics_by_drs = {}
     failures = [
         {"consignmentId": cid, "reason": "Consignment not found."}
@@ -589,8 +636,10 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                 # The accepted preview's pincode, so the row isn't blank.
                 geocode_result["pincode"] = confirmed.pincode
             error_reason = None
+            _memo_entry_id = None
             resolution, source = _confirmed_classification(confirmed)
             accepted_pin = geocode_result
+            cache_id = None
             logger.info(
                 "Using executive-confirmed location for consignment %s (corrected=%s)",
                 consignment_id, confirmed.corrected,
@@ -623,14 +672,25 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                 # safe to call unconditionally - it updates the existing row
                 # if this exact spelling was already cached, never doubles it.
                 if _memo_entry_id:
-                    _safe(
+                    cache_id = _cache_id(_safe(
                         save_to_cache, geocode_address_str, geocode_result,
                         lookup_address=receiver_address or None,
                         source=confirmed_source,
                         drs_memo_group=drs_memo.group_id(memo_drs_id, _memo_entry_id),
-                    )
+                    ))
+            # A human-confirmed pin owns a cache record even outside a DRS.
+            # The no-group write is safe and makes later correction/restore
+            # actions address a stable cache id.
+            if not cache_id:
+                cache_id = _cache_id(_safe(
+                    save_to_cache, geocode_address_str, geocode_result,
+                    lookup_address=receiver_address or None,
+                    source=confirmed_source,
+                ))
+            if cache_id and memo_drs_id and _memo_entry_id:
+                _safe(drs_memo.link, memo_drs_id, _memo_entry_id, cache_id=cache_id)
         else:
-            geocode_result, error_reason, error_code, cache_outcome, resolution, source = \
+            geocode_result, error_reason, error_code, cache_outcome, resolution, source, cache_id = \
                 _unpack_geocode(_geocode(
                     geocode_address_str,
                     lookup_address=receiver_address or None,
@@ -684,6 +744,12 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                 resolution=resolution,
             ))
             continue
+
+        if cache_id:
+            cache_metadata_by_cid[consignment_id] = {
+                "cache_id": cache_id,
+                "person_corrected": bool(confirmed and confirmed.corrected),
+            }
 
         exception_flag = derive_exception_flag(geocode_result)
         if use_v2:
@@ -750,6 +816,15 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
             # gets cleaned up on this consignment's next save instead.
             logger.exception("Failed to deactivate stale routing rows")
         bq_rows = fetch_rows_by_consignment_drs_pairs(saved_pairs)
+        try:
+            set_routing_cache_metadata(
+                {cid: item for cid, item in cache_metadata_by_cid.items()
+                 if cid in {saved_cid for saved_cid, _drs in saved_pairs}}
+            )
+        except Exception:
+            # Ownership metadata enriches cache management only; the route
+            # save itself has already completed in BigQuery.
+            logger.exception("Failed to store geocode cache ownership metadata")
         upsert_consignments_routing(bq_rows)
         try:
             saved_ids = {cid for cid, _drs in saved_pairs}

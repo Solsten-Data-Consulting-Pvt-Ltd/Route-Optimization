@@ -46,6 +46,7 @@ def _install_offline_candidates():
     from app.services import save
 
     save.set_routing_candidates = lambda *_a, **_k: 0
+    save.set_routing_cache_metadata = lambda *_a, **_k: 0
 
 
 _install_offline_candidates()

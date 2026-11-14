@@ -80,6 +80,7 @@ from app.config import (
     GEOCODE_CACHE_UNVERIFIED_TTL_DAYS,
 )
 from app.db.clients import get_fs_client
+from app.services.address_match import door_numbers, is_precise, loose_key, match_key
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +186,74 @@ def _collection():
     return get_fs_client().collection(GEOCODE_CACHE_COLLECTION)
 
 
+def distance_meters(latitude_a, longitude_a, latitude_b, longitude_b) -> Optional[float]:
+    """Great-circle distance, or None when either point is incomplete."""
+    values = (latitude_a, longitude_a, latitude_b, longitude_b)
+    if not all(isinstance(value, (int, float)) for value in values):
+        return None
+    from math import asin, cos, radians, sin, sqrt
+
+    delta_lat = radians(latitude_b - latitude_a)
+    delta_lng = radians(longitude_b - longitude_a)
+    a = (
+        sin(delta_lat / 2) ** 2
+        + cos(radians(latitude_a)) * cos(radians(latitude_b)) * sin(delta_lng / 2) ** 2
+    )
+    return 6_371_000 * 2 * asin(sqrt(a))
+
+
+def _record_variant(doc_ref, normalized: str) -> None:
+    """Remember a spelling without changing the cache entry's identity."""
+    if not normalized:
+        return
+    doc_ref.update({
+        "address_normalized_variants": firestore.ArrayUnion([normalized]),
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
+
+
+def get_cache_entry(cache_id: str):
+    """Return an entry by its Firestore id, including unverified entries."""
+    if not cache_id:
+        return None
+    snap = _collection().document(cache_id).get()
+    return (snap.id, snap.to_dict() or {}) if snap.exists else None
+
+
+def find_cache_entry(normalized: str):
+    """Find any cache entry for an exact spelling or its variants.
+
+    Unlike `_exact_lookup`, this intentionally includes unverified entries for
+    the cache-owner API. Serving geocodes remains verified-only.
+    """
+    if not normalized:
+        return None
+    docs = list(_collection().where("address_normalized", "==", normalized).limit(1).stream())
+    if not docs:
+        docs = list(
+            _collection()
+            .where("address_normalized_variants", "array_contains", normalized)
+            .limit(1)
+            .stream()
+        )
+    if not docs:
+        return None
+    return docs[0].id, (docs[0].to_dict() or {})
+
+
+def find_cache_entry_by_place_id_near(place_id: str, result: dict, radius_meters=50):
+    """One place-id represents one Google location; reuse it only nearby."""
+    if not place_id or not result:
+        return None
+    latitude, longitude = result.get("latitude"), result.get("longitude")
+    for doc in _collection().where("place_id", "==", place_id).stream():
+        data = doc.to_dict() or {}
+        distance = distance_meters(latitude, longitude, data.get("latitude"), data.get("longitude"))
+        if distance is not None and distance <= radius_meters:
+            return doc.id, data
+    return None
+
+
 def _expiry_fields(existing: Optional[dict] = None) -> dict:
     """`expire_at` for an UNVERIFIED doc; {} when the existing doc is verified.
 
@@ -253,29 +322,48 @@ def _exact_lookup(normalized: str):
         return None
     return docs[0].id, (docs[0].to_dict() or {})
 
+def _is_safe_fuzzy_match(incoming: str, cached: str) -> bool:
+    """A fuzzy text score cannot overrule a different building number.
+
+    Vague road-only strings are equally unsafe: a high token score there means
+    only that two labels name the same road, not the same delivery point.
+    """
+    incoming_key = loose_key(match_key(incoming))
+    cached_key = loose_key(match_key(cached))
+    if not is_precise(incoming_key) or not is_precise(cached_key):
+        return False
+    incoming_doors = door_numbers(incoming_key)
+    cached_doors = door_numbers(cached_key)
+    return not (
+        incoming_doors
+        and cached_doors
+        and not (incoming_doors <= cached_doors or cached_doors <= incoming_doors)
+    )
+
+
 def _fuzzy_lookup(normalized: str):
     entries = _verified_entries()
     if not entries:
         return None
 
     candidates = {doc_id: data.get("address_normalized") or "" for doc_id, data in entries}
-    match = process.extractOne(
+    matches = process.extract(
         normalized,
         candidates,
         scorer=fuzz.token_sort_ratio,
         processor=utils.default_process,
         score_cutoff=GEOCODE_CACHE_FUZZY_THRESHOLD,
     )
-    if not match:
-        return None  # cache miss -> caller falls through to places_search_address()
+    for _matched_text, score, doc_id in matches:
+        data = next(d for i, d in entries if i == doc_id)
+        if not _is_safe_fuzzy_match(normalized, data.get("address_normalized") or ""):
+            continue
+        logger.info("Fuzzy geocode cache hit (score=%.1f) for '%s'", score, normalized[:60])
+        return doc_id, data
+    return None  # cache miss -> caller falls through to places_search_address()
 
-    _matched_text, score, doc_id = match
-    data = next(d for i, d in entries if i == doc_id)
-    logger.info("Fuzzy geocode cache hit (score=%.1f) for '%s'", score, normalized[:60])
-    return doc_id, data
 
-
-def _result_from_cache(data: dict, address: str) -> dict:
+def _result_from_cache(data: dict, address: str, *, outcome=None, normalized=None) -> dict:
     result = {field: data.get(field) for field in CACHED_RESULT_FIELDS}
     result["types"] = result.get("types") or []
     result["partial_match"] = bool(result.get("partial_match"))
@@ -283,13 +371,29 @@ def _result_from_cache(data: dict, address: str) -> dict:
     requested_pin_match = PINCODE_RE.search(address or "")
     requested_pin = requested_pin_match.group(0) if requested_pin_match else None
     cached_pin = result.get("pincode")
-    result["pincode_match"] = not (requested_pin and cached_pin and requested_pin != cached_pin)
+    label_pincodes = {str(pin) for pin in (data.get("label_pincodes") or []) if pin}
+    lookup_key = normalized or data.get("address_normalized") or ""
+    precise = is_precise(loose_key(match_key(lookup_key)))
+    if outcome == "fuzzy_hit":
+        # A similar spelling needs prior label evidence for this pincode.
+        result["pincode_match"] = not requested_pin or requested_pin in label_pincodes
+    elif outcome == "exact_hit" and not precise:
+        # Exact road-only text is safe only after this label pincode has been
+        # seen on a delivery; building-level exact text does not nag ops.
+        result["pincode_match"] = not requested_pin or requested_pin in label_pincodes
+    elif outcome == "exact_hit":
+        # Exact, building-level text is stronger evidence than a pincode
+        # disagreement in an address label; do not create a review badge.
+        result["pincode_match"] = True
+    else:
+        result["pincode_match"] = not (requested_pin and cached_pin and requested_pin != cached_pin)
     return result
 
 
 def get_cached_geocode_with_outcome(
     address: str,
     lookup_address: Optional[str] = None,
+    include_cache_id: bool = False,
 ) -> Tuple[Optional[dict], str]:
     """Return a cached result and its outcome: exact_hit, fuzzy_hit, or miss.
 
@@ -321,10 +425,13 @@ def get_cached_geocode_with_outcome(
             "hit_count": firestore.Increment(1),
             "last_hit_at": firestore.SERVER_TIMESTAMP,
         })
+        if outcome == "fuzzy_hit":
+            _record_variant(_collection().document(doc_id), normalized)
     except Exception:
         logger.exception("Geocode cache hit_count update failed")
 
-    return _result_from_cache(data, address), outcome
+    result = _result_from_cache(data, address, outcome=outcome, normalized=normalized)
+    return (result, outcome, doc_id) if include_cache_id else (result, outcome)
 
 
 def get_cached_geocode(
@@ -361,13 +468,26 @@ def _docs_by_group(drs_memo_group: str):
     return list(docs.values())
 
 
+def _label_pincodes(address: str, result: dict) -> list[str]:
+    """Pincodes actually observed with this cache label.
+
+    The Google result can have a locality pincode that is broader than the
+    receiver's typed label. Keep both, but never invent a label pincode from
+    normalization (which intentionally removes it).
+    """
+    values = set(PINCODE_RE.findall(address or ""))
+    if result and result.get("pincode"):
+        values.add(str(result["pincode"]))
+    return sorted(values)
+
+
 def save_to_cache(
     address: str,
     geocode_result: dict,
     lookup_address: Optional[str] = None,
     source: str = "api",
     drs_memo_group: Optional[str] = None,
-) -> None:
+) -> Optional[str]:
     """Persist a geocode result to the cache.
 
     Fix 1 — `lookup_address` is the raw receiver address WITHOUT the receiver
@@ -387,7 +507,7 @@ def save_to_cache(
     key_str = lookup_address if lookup_address else address
     normalized = normalize_address(key_str)
     if not normalized or not geocode_result:
-        return
+        return None
 
     payload = {field: geocode_result.get(field) for field in CACHED_RESULT_FIELDS}
     payload["types"] = payload.get("types") or []
@@ -399,6 +519,11 @@ def save_to_cache(
         "source": source,
         "updated_at": firestore.SERVER_TIMESTAMP,
     })
+    label_pincodes = _label_pincodes(address, geocode_result)
+    label_update = (
+        {"label_pincodes": firestore.ArrayUnion(label_pincodes)}
+        if label_pincodes else {}
+    )
     # The group tag is NOT part of `payload`: an existing doc keeps its creating
     # group and only gains this one in `drs_memo_groups` (see _docs_by_group).
     group_update = (
@@ -433,18 +558,21 @@ def save_to_cache(
             siblings[0].reference.update({
                 **sibling_payload,
                 **group_update,
+                **label_update,
                 **_expiry_fields(siblings[0].to_dict()),
                 "address_normalized_variants": firestore.ArrayUnion([normalized]),
             })
-            return
+            return siblings[0].id
 
     doc_ref = _collection().document(cache_key(normalized))
     # An existing entry keeps its ops verdict and hit count; only the geocode
     # payload is refreshed.
     existing = doc_ref.get()
     if existing.exists:
-        doc_ref.update({**payload, **group_update, **_expiry_fields(existing.to_dict())})
-        return
+        doc_ref.update({**payload, **group_update, **label_update,
+                        **_expiry_fields(existing.to_dict())})
+        _record_variant(doc_ref, normalized)
+        return doc_ref.id
 
     # An entry with this exact normalized text may live under a DIFFERENT id: a
     # legacy auto-id doc from before entries were hash-keyed, or one written
@@ -462,9 +590,11 @@ def save_to_cache(
             if k not in ("address_normalized", "address_raw", "geocode_address_raw")
         }
         same_text[0].reference.update(
-            {**text_payload, **group_update, **_expiry_fields(same_text[0].to_dict())}
+            {**text_payload, **group_update, **label_update,
+             **_expiry_fields(same_text[0].to_dict())}
         )
-        return
+        _record_variant(same_text[0].reference, normalized)
+        return same_text[0].id
 
     # This exact spelling has no doc of its own - but it may already be a
     # recorded VARIANT of another doc (absorbed there under a drs_memo_group
@@ -486,9 +616,33 @@ def save_to_cache(
             if k not in ("address_normalized", "address_raw", "geocode_address_raw")
         }
         variant_matches[0].reference.update(
-            {**sibling_payload, **group_update, **_expiry_fields(variant_matches[0].to_dict())}
+            {**sibling_payload, **group_update, **label_update,
+             **_expiry_fields(variant_matches[0].to_dict())}
         )
-        return
+        _record_variant(variant_matches[0].reference, normalized)
+        return variant_matches[0].id
+
+    # Places occasionally returns several spellings for exactly the same
+    # physical location. Avoid one cache doc per spelling when place-id and
+    # coordinates agree; record this spelling as a variant of the owner.
+    same_place = find_cache_entry_by_place_id_near(
+        geocode_result.get("place_id"), geocode_result,
+    )
+    if same_place:
+        existing_id, existing_data = same_place
+        owner_ref = _collection().document(existing_id)
+        owner_payload = {
+            key: value for key, value in payload.items()
+            if key not in ("address_normalized", "address_raw", "geocode_address_raw")
+        }
+        owner_ref.update({
+            **owner_payload,
+            **group_update,
+            **label_update,
+            **_expiry_fields(existing_data),
+            "address_normalized_variants": firestore.ArrayUnion([normalized]),
+        })
+        return existing_id
 
     # create() (not set()): if another request wrote this same id after the
     # exists() check above, set() would replace that doc wholesale and reset its
@@ -499,6 +653,7 @@ def save_to_cache(
             **({"drs_memo_group": drs_memo_group, "drs_memo_groups": [drs_memo_group]}
                if drs_memo_group else {}),
             "address_normalized_variants": [normalized],
+            "label_pincodes": label_pincodes,
             "verified": False,
             "verified_by": None,
             "verified_at": None,
@@ -506,8 +661,12 @@ def save_to_cache(
             "created_at": firestore.SERVER_TIMESTAMP,
             **_expiry_fields(),
         })
+        return doc_ref.id
     except AlreadyExists:
-        doc_ref.update({**payload, **group_update, **_expiry_fields(doc_ref.get().to_dict())})
+        doc_ref.update({**payload, **group_update, **label_update,
+                        **_expiry_fields(doc_ref.get().to_dict())})
+        _record_variant(doc_ref, normalized)
+        return doc_ref.id
 
 
 def verify_cache_group(drs_memo_group: str, verified_by: str) -> int:
