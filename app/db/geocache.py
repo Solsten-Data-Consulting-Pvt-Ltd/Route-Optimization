@@ -363,6 +363,24 @@ def _fuzzy_lookup(normalized: str):
     return None  # cache miss -> caller falls through to places_search_address()
 
 
+def _label_evidence_pincodes(data: dict) -> set:
+    """Pincodes this entry already has evidence for.
+
+    `label_pincodes` is learned from deliveries, so an entry that was verified
+    before it existed has none. For a VERIFIED entry (a person confirmed the
+    pin) the pincode written in its own address text counts as evidence too.
+    Spellings in address_normalized(_variants) cannot be used: normalize_address
+    strips pincodes, so only the raw / formatted address still carries one.
+    """
+    pins = {str(pin) for pin in (data.get("label_pincodes") or []) if pin}
+    if data.get("verified") is True:
+        for field in ("address_raw", "formatted_address"):
+            pins.update(PINCODE_RE.findall(str(data.get(field) or "")))
+        if data.get("pincode"):
+            pins.add(str(data["pincode"]))
+    return pins
+
+
 def _result_from_cache(data: dict, address: str, *, outcome=None, normalized=None) -> dict:
     result = {field: data.get(field) for field in CACHED_RESULT_FIELDS}
     result["types"] = result.get("types") or []
@@ -371,7 +389,7 @@ def _result_from_cache(data: dict, address: str, *, outcome=None, normalized=Non
     requested_pin_match = PINCODE_RE.search(address or "")
     requested_pin = requested_pin_match.group(0) if requested_pin_match else None
     cached_pin = result.get("pincode")
-    label_pincodes = {str(pin) for pin in (data.get("label_pincodes") or []) if pin}
+    label_pincodes = _label_evidence_pincodes(data)
     lookup_key = normalized or data.get("address_normalized") or ""
     precise = is_precise(loose_key(match_key(lookup_key)))
     if outcome == "fuzzy_hit":
