@@ -50,3 +50,26 @@ class SaveConsignmentsRequest(BaseModel):
 
 class RunSortingRequest(BaseModel):
     drsno: Optional[str] = Field(default=None)
+
+
+class DeliveryLocation(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    accuracy: Optional[float] = Field(default=None, ge=0)
+
+
+class GeocodeCacheConfirmRequest(BaseModel):
+    consignmentId: str = Field(min_length=1)
+    deliveryLocation: DeliveryLocation
+    actor: str = Field(min_length=1)
+
+
+class GeocodeCacheCorrectRequest(BaseModel):
+    consignmentId: str = Field(min_length=1)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    actor: str = Field(min_length=1)
+
+
+class GeocodeCacheRestoreRequest(BaseModel):
+    previous: Dict[str, Any]

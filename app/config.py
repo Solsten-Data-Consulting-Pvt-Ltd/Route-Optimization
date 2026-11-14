@@ -19,6 +19,12 @@ GEOCODE_CACHE_SNAPSHOT_TTL_SECONDS = 300
 # auto-delete this many days after their last write, via a Firestore TTL policy
 # on `expire_at`. Verified docs have no `expire_at` and are never deleted.
 GEOCODE_CACHE_UNVERIFIED_TTL_DAYS = 3
+# A delivery can verify a pin only after separate DRS visits agree with it.
+# These are deploy-time constants, deliberately not feature flags.
+GEOCODE_CACHE_VERIFY_RADIUS_METERS = 150
+GEOCODE_CACHE_MIN_VISITS = 2
+GEOCODE_CACHE_MAX_OBSERVATIONS = 20
+GEOCODE_CACHE_MAX_OBSERVATION_ACCURACY_METERS = 100
 
 # DRS address memo: reuse a pin for same-place consignments within one DRS.
 DRS_MEMO_COLLECTION = "drs_address_memo"

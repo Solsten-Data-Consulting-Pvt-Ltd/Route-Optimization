@@ -11,6 +11,13 @@ CONSIGNMENTS_COLLECTION = "consignments"
 ROUTING_COLLECTION = "consignments_routing"
 DRS_STARTING_POINT_COLLECTION = "drs_starting_point"
 
+# Sources which represent an automated choice, rather than a person moving a
+# pin. A correction records one of these exactly once as audit context.
+AUTOMATED_GEO_SOURCES = {
+    "cache_exact", "cache_fuzzy", "memo", "memo_corrected",
+    "places", "places_retry", "preview",
+}
+
 
 def get_consignments_by_id(consignment_ids):
     fs_client = get_fs_client()
@@ -207,6 +214,46 @@ def set_routing_candidates(candidates_by_consignment):
     for consignment_id, candidates in candidates_by_consignment.items():
         doc_ref = fs_client.collection(ROUTING_COLLECTION).document(consignment_id)
         batch.set(doc_ref, {"geocode_candidates": candidates or None}, merge=True)
+        count += 1
+        if count % FIRESTORE_BATCH_SIZE == 0:
+            batch.commit()
+            batch = fs_client.batch()
+    if count % FIRESTORE_BATCH_SIZE != 0:
+        batch.commit()
+    return count
+
+
+def set_routing_cache_metadata(metadata_by_consignment):
+    """Set cache ownership without adding BigQuery columns.
+
+    `geocode_source_original` is deliberately captured before the normal save
+    writer updates `geocode_source`: it answers "what automated pin did this
+    person replace?" and is never overwritten by later edits.
+    """
+    if not metadata_by_consignment:
+        return 0
+    fs_client = get_fs_client()
+    batch = fs_client.batch()
+    count = 0
+    for consignment_id, metadata in metadata_by_consignment.items():
+        cache_id = (metadata or {}).get("cache_id")
+        if not cache_id:
+            continue
+        doc_ref = fs_client.collection(ROUTING_COLLECTION).document(consignment_id)
+        try:
+            previous = doc_ref.get().to_dict() or {}
+        except Exception:
+            logger.exception("Could not read routing document %s for cache metadata", consignment_id)
+            previous = {}
+        payload = {"geocode_cache_id": cache_id}
+        previous_source = previous.get("geocode_source")
+        if (
+            (metadata or {}).get("person_corrected")
+            and not previous.get("geocode_source_original")
+            and previous_source in AUTOMATED_GEO_SOURCES
+        ):
+            payload["geocode_source_original"] = previous_source
+        batch.set(doc_ref, payload, merge=True)
         count += 1
         if count % FIRESTORE_BATCH_SIZE == 0:
             batch.commit()

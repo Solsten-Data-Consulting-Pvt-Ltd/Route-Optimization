@@ -101,6 +101,7 @@ def result_from_entry(entry: dict, address: str) -> dict:
 def remember(drs_id, info: dict, result: dict, source: str, *,
              lookup_address: Optional[str] = None,
              consignment_id: Optional[str] = None,
+             cache_id: Optional[str] = None,
              entries: Optional[dict] = None,
              _target_entry_id: Optional[str] = None) -> Optional[str]:
     """Store `result` as this consignment's memo entry. Returns the entry id.
@@ -123,7 +124,8 @@ def remember(drs_id, info: dict, result: dict, source: str, *,
         entries = load_entries(drs_id)
     existing = entries.get(entry_id)
     if existing and _SOURCE_PRIORITY.get(existing.get("source"), 0) > _SOURCE_PRIORITY.get(source, 0):
-        link(drs_id, entry_id, lookup_address=lookup_address, consignment_id=consignment_id)
+        link(drs_id, entry_id, lookup_address=lookup_address,
+             consignment_id=consignment_id, cache_id=cache_id)
         return entry_id
 
     entry = {field: result.get(field) for field in CACHED_RESULT_FIELDS}
@@ -132,6 +134,8 @@ def remember(drs_id, info: dict, result: dict, source: str, *,
     entry["match"] = {field: info.get(field) for field in MATCH_FIELDS}
     entry["source"] = source
     entry["updated_at"] = firestore.SERVER_TIMESTAMP
+    if cache_id:
+        entry["cache_id"] = cache_id
     if lookup_address:
         entry["variants"] = firestore.ArrayUnion([lookup_address])
     if consignment_id:
@@ -146,7 +150,8 @@ def remember(drs_id, info: dict, result: dict, source: str, *,
     return entry_id
 
 
-def link(drs_id, entry_id, *, lookup_address=None, consignment_id=None, phones=None) -> None:
+def link(drs_id, entry_id, *, lookup_address=None, consignment_id=None, phones=None,
+         cache_id=None) -> None:
     """Record that another consignment reused this entry's pin.
 
     `phones` (the new consignment's receiver phones) are added to the entry's
@@ -162,6 +167,8 @@ def link(drs_id, entry_id, *, lookup_address=None, consignment_id=None, phones=N
         update["variants"] = firestore.ArrayUnion([lookup_address])
     if consignment_id:
         update["consignment_ids"] = firestore.ArrayUnion([consignment_id])
+    if cache_id:
+        update["cache_id"] = cache_id
     if not update:
         return
     _doc(drs_id).set({
@@ -174,6 +181,7 @@ def link(drs_id, entry_id, *, lookup_address=None, consignment_id=None, phones=N
 def reconcile(drs_id, info: dict, result: dict, source: str, *,
               lookup_address: Optional[str] = None,
               consignment_id: Optional[str] = None,
+              cache_id: Optional[str] = None,
               entries: Optional[dict] = None) -> Tuple[dict, Optional[str]]:
     """Like `remember`, but runs `find_match` first so a pin that was NOT
     reached via `_geocode` (i.e. an executive-confirmed location, which
@@ -219,15 +227,16 @@ def reconcile(drs_id, info: dict, result: dict, source: str, *,
             # Existing entry is at least as trustworthy - reuse its pin
             # instead of drifting off on this consignment's own point.
             link(drs_id, match_id, lookup_address=lookup_address, consignment_id=consignment_id,
-                 phones=(info or {}).get("phones"))
+                 phones=(info or {}).get("phones"), cache_id=cache_id)
             return result_from_entry(entry, lookup_address or ""), match_id
         # This source outranks the match - upgrade that SAME entry in
         # place (not a new one keyed on this address's own hash).
         remember(drs_id, info, result, source, lookup_address=lookup_address,
-                 consignment_id=consignment_id, entries=entries, _target_entry_id=match_id)
+                 consignment_id=consignment_id, cache_id=cache_id,
+                 entries=entries, _target_entry_id=match_id)
         return result, match_id
 
     # No existing entry for this place - fall back to hash-keyed remember.
     remember(drs_id, info, result, source, lookup_address=lookup_address,
-             consignment_id=consignment_id, entries=entries)
+             consignment_id=consignment_id, cache_id=cache_id, entries=entries)
     return result, entry_id

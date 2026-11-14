@@ -5,6 +5,7 @@ normalize_address() function and the rapidfuzz scorer are exercised here.
 Includes testing Fix 1 (address-only lookup key), Fix 2 (Plus Codes), and Fix 3 (building variants).
 """
 
+import tests  # noqa: F401 - environment for app module imports
 import hashlib
 import re
 import unittest
@@ -12,6 +13,7 @@ import unittest
 from rapidfuzz import fuzz, utils
 
 from app.services.address import build_geocode_address, normalize_to_single_line
+from app.db.geocache import _is_safe_fuzzy_match, _result_from_cache
 
 # --- Mirrors app/db/geocache.py ---
 GEOCODE_CACHE_FUZZY_THRESHOLD = 85
@@ -201,6 +203,36 @@ class TestFuzzyMatchVariations(unittest.TestCase):
         )
         self.assertFalse(hit)
         self.assertLess(score, GEOCODE_CACHE_FUZZY_THRESHOLD)
+
+
+class TestSafeCacheReuse(unittest.TestCase):
+    def test_conflicting_door_numbers_cannot_be_a_fuzzy_hit(self):
+        self.assertFalse(_is_safe_fuzzy_match(
+            "No 12 Main Road Bengaluru", "No 14 Main Road Bengaluru",
+        ))
+
+    def test_road_only_label_cannot_be_a_fuzzy_hit(self):
+        self.assertFalse(_is_safe_fuzzy_match(
+            "MG Road Bengaluru", "MG Road Bengaluru Karnataka",
+        ))
+
+    def test_exact_building_label_ignores_a_pincode_disagreement(self):
+        result = _result_from_cache(
+            {"pincode": "560001", "address_normalized": "12 mg road bengaluru"},
+            "No 12 MG Road Bengaluru 560002",
+            outcome="exact_hit", normalized="12 mg road bengaluru",
+        )
+        self.assertTrue(result["pincode_match"])
+
+    def test_fuzzy_label_requires_seen_pincode(self):
+        data = {"pincode": "560001", "label_pincodes": ["560001"],
+                "address_normalized": "12 mg road bengaluru"}
+        known = _result_from_cache(data, "No 12 MG Road Bengaluru 560001",
+                                   outcome="fuzzy_hit", normalized="12 mg road bengaluru")
+        unknown = _result_from_cache(data, "No 12 MG Road Bengaluru 560002",
+                                     outcome="fuzzy_hit", normalized="12 mg road bengaluru")
+        self.assertTrue(known["pincode_match"])
+        self.assertFalse(unknown["pincode_match"])
 
 
 if __name__ == "__main__":

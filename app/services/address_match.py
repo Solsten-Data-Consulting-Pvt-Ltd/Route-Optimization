@@ -173,7 +173,9 @@ def _entry_id(key: str) -> str:
 def consignment_match_info(receiver: dict) -> dict:
     """Everything the DRS memo needs from `consignment.receiver`."""
     receiver = receiver or {}
-    comp = receiver.get("addressComponent") or {}
+    # OCR writes addressComponent, while preview/save payloads have also used
+    # the plural spelling. Both describe the same structured address.
+    comp = receiver.get("addressComponent") or receiver.get("addressComponents") or {}
 
     formatted = normalize_to_single_line(str(receiver.get("address") or ""))
     raw = normalize_to_single_line(str(receiver.get("fullAddress") or ""))
