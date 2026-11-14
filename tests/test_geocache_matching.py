@@ -234,6 +234,34 @@ class TestSafeCacheReuse(unittest.TestCase):
         self.assertTrue(known["pincode_match"])
         self.assertFalse(unknown["pincode_match"])
 
+    def test_verified_entry_counts_its_own_address_pincode_as_evidence(self):
+        # Verified before label_pincodes existed: no learned list, no stored pincode.
+        data = {"verified": True, "address_normalized": "shahi exports bellandur gate",
+                "address_raw": "Shahi Exports, Bellandur Gate, Karnataka 560102, India"}
+        same = _result_from_cache(data, "Shahi Exports Beilandur Gate Bengaluru 560102",
+                                  outcome="fuzzy_hit", normalized="shahi exports beilandur gate")
+        other = _result_from_cache(data, "Shahi Exports Beilandur Gate Bengaluru 560103",
+                                   outcome="fuzzy_hit", normalized="shahi exports beilandur gate")
+        self.assertTrue(same["pincode_match"])
+        self.assertFalse(other["pincode_match"])
+
+    def test_unverified_entry_does_not_borrow_its_address_pincode(self):
+        data = {"verified": False, "address_normalized": "shahi exports bellandur gate",
+                "address_raw": "Shahi Exports, Bellandur Gate, Karnataka 560102, India"}
+        result = _result_from_cache(data, "Shahi Exports Beilandur Gate Bengaluru 560102",
+                                    outcome="fuzzy_hit", normalized="shahi exports beilandur gate")
+        self.assertFalse(result["pincode_match"])
+
+    def test_verified_road_level_exact_hit_uses_the_same_evidence(self):
+        data = {"verified": True, "address_normalized": "sarjapura road bengaluru",
+                "formatted_address": "Sarjapura Road, Bengaluru, Karnataka 560035, India"}
+        seen = _result_from_cache(data, "Sarjapur Road Bangalore 560035",
+                                  outcome="exact_hit", normalized="sarjapura road bengaluru")
+        new = _result_from_cache(data, "Sarjapur Road Bangalore 560103",
+                                 outcome="exact_hit", normalized="sarjapura road bengaluru")
+        self.assertTrue(seen["pincode_match"])
+        self.assertFalse(new["pincode_match"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
