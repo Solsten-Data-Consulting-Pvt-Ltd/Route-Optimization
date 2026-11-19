@@ -45,14 +45,27 @@ SAME_PLACE_SPREAD_M = 300
 # Road distances for route sorting (featureFlags/roadDistanceRouting).
 # Google Routes API, Compute Route Matrix, TRAFFIC_UNAWARE (Essentials SKU).
 ROUTES_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
-# Road distance is fetched only from each stop to its N nearest stops (by
-# straight line); the solver never links far-apart stops directly, so those
-# pairs use straight line x ROAD_DETOUR_FACTOR instead. Cuts API use ~75 %.
-ROAD_DISTANCE_NEIGHBOURS = 8
+# Large DRSs only (see ROAD_FULL_MATRIX_MAX_POINTS): road distance is fetched
+# from each stop to its N nearest stops (by straight line), in both directions;
+# other pairs are estimated (see the detour factor below).
+ROAD_DISTANCE_NEIGHBOURS = 12
 ROAD_DETOUR_FACTOR = 1.4
+# Any pair still estimated (large DRS, cap, API error) uses this DRS's own
+# typical road/straight-line ratio from the pairs just looked up, clamped to
+# this range; ROAD_DETOUR_FACTOR only when there are too few samples.
+ROAD_DETOUR_FACTOR_MIN = 1.3
+ROAD_DETOUR_FACTOR_MAX = 3.0
+ROAD_DETOUR_MIN_SAMPLES = 5
+# DRSs up to this many points (stops + start) get the FULL road matrix: every
+# pair is looked up, nothing is guessed (60 stops = 3,660 elements the first
+# time; repeats come from the cache). Larger DRSs fall back to each stop's
+# nearest ROAD_DISTANCE_NEIGHBOURS, both directions.
+ROAD_FULL_MATRIX_MAX_POINTS = 61
+# Destinations per Compute Route Matrix request (one origin each).
+ROAD_MAX_DESTINATIONS_PER_REQUEST = 25
 # Hard cap on billable matrix elements per optimize run (budget guard); pairs
-# beyond it use the straight-line estimate.
-ROAD_MAX_ELEMENTS_PER_RUN = 600
+# beyond it use the estimate.
+ROAD_MAX_ELEMENTS_PER_RUN = 4000
 ROAD_REQUEST_TIMEOUT_S = 10
 ROAD_MAX_PARALLEL_REQUESTS = 8
 # Cache of road distances between ~150 m cells (geohash-7), per direction.
