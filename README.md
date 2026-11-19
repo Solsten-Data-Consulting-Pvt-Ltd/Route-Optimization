@@ -117,6 +117,30 @@ source stays `places_retry` ("from Google"); no new status or badge.
 Why: SMG9041167 (dev, 19 Nov) - handwritten "Mana Karmel" read as "Manu
 Kurmel"; Places returned "Carmelaram, Hadosiddapura" ~700 m away as CONFIDENT.
 
+#### Name-aware "Several matches" (with `geocodeResolutionV2`)
+
+Only the old MULTI_CANDIDATE case (2+ in-PIN results more than 300 m apart)
+looks at names. The names on the label are `premise` / `sub_premise` plus the
+first three address parts that look like a building or business (two or more
+words; not a road, area, the label's own locality, or a "near / opposite"
+phrase). A result matches when its name resembles one of them (spelling
+tolerant, or at least two words and 75% of the label name found in it; one
+shared word never matches, so "Wipro" does not match "Wipro Technologies"; area
+results never match).
+
+- exactly one match -> CONFIDENT, that result
+- several matches within `COMPOUND_SPREAD_M` (800 m): one compound (towers,
+  phases, gates, duplicate listings) -> CONFIDENT, best-named one
+- several matches farther apart -> MULTI_CANDIDATE, listing ONLY those
+- no match (a landmark or random places) -> the building-name retry above; a hit
+  there becomes CONFIDENT (`places_retry`), otherwise the stop stays Several
+  matches exactly as before (same pin, same list)
+- no building name on the label -> exactly as before
+
+No new resolution code, flag or badge. Replay of the 31 MULTI_CANDIDATE stops in
+prod (19 Nov): 13 became CONFIDENT, 12 go to the retry (then stay Several
+matches if it finds nothing), 2 stay Several matches (far apart), 3 unchanged. Tests: `tests/test_name_aware_matches.py`.
+
 #### Re-optimize after the driver has started (always on)
 
 When some stops are already Delivered / Not_Delivered, the remaining stops are

@@ -41,6 +41,10 @@ FEATURE_FLAG_TTL_SECONDS = int(os.environ.get("FEATURE_FLAG_TTL_SECONDS", "45"))
 # Address resolution: Places candidates closer than this count as one place.
 PLACES_CANDIDATE_PAGE_SIZE = 5
 SAME_PLACE_SPREAD_M = 300
+# Results whose names match the label's building name and sit within this
+# distance of each other are one compound (towers, phases, gates, duplicate
+# listings), not "several matches".
+COMPOUND_SPREAD_M = 800
 
 # Road distances for route sorting (featureFlags/roadDistanceRouting).
 # Google Routes API, Compute Route Matrix, TRAFFIC_UNAWARE (Essentials SKU).

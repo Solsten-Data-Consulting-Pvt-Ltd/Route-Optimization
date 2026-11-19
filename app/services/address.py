@@ -106,6 +106,20 @@ _UNIT_WORDS = {
 }
 
 
+def _clean_name(raw):
+    """A name-like string with flat/door/floor numbers and unit labels removed,
+    or None when fewer than 3 letters are left."""
+    words = []
+    for token in re.split(r"[\s,/#:.-]+", str(raw or "")):
+        if not token or any(ch.isdigit() for ch in token):
+            continue
+        if token.lower() in _UNIT_WORDS:
+            continue
+        words.append(token)
+    name = " ".join(words).strip()
+    return name if len(re.sub(r"[^A-Za-z]", "", name)) >= 3 else None
+
+
 def building_name_from_components(components):
     """The building/complex name from the OCR address components, with flat,
     door, floor and block numbers and labels removed: "8, Manu Kurmel" ->
@@ -114,18 +128,55 @@ def building_name_from_components(components):
     if not isinstance(components, dict):
         return None
     for key in ("premise", "sub_premise"):
-        raw = str(components.get(key) or "")
-        words = []
-        for token in re.split(r"[\s,/#:.-]+", raw):
-            if not token or any(ch.isdigit() for ch in token):
-                continue
-            if token.lower() in _UNIT_WORDS:
-                continue
-            words.append(token)
-        name = " ".join(words).strip()
-        if len(re.sub(r"[^A-Za-z]", "", name)) >= 3:
+        name = _clean_name(components.get(key))
+        if name:
             return name
     return None
+
+
+# Words that make a first address part an area or a road, not a building.
+_AREA_WORDS = {
+    "road", "rd", "main", "cross", "layout", "nagar", "colony", "street", "st",
+    "lane", "circle", "junction", "post", "village", "stage", "sector",
+    "extension", "extn", "avenue", "highway", "bridge", "gate",
+}
+_LANDMARK_LEADS = {"to", "near", "opp", "opposite", "behind", "beside", "next", "off", "adjacent", "nr"}
+_AREA_KEYS = ("locality", "sub_locality", "route", "street", "neighborhood", "landmark")
+
+
+def address_match_names(components, address=None):
+    """Names the label gives the destination building, for judging Places
+    results: premise and sub_premise (cleaned), plus every part of the address
+    text that looks like a building or business of at least two words
+    ("Prestige Ferns Residency", "Mataji Gas Agency") - not an area, road,
+    the label's own locality/landmark, a landmark phrase (near, opposite...), or
+    a single word. Only the first three parts are read. Both premise and
+    parts are used because a tower name ("Jasper") and the compound name can
+    sit in different parts. Empty list when there is no building name."""
+    comps = components if isinstance(components, dict) else {}
+    names, seen = [], set()
+
+    def add(name):
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            names.append(name)
+
+    for raw in (comps.get("premise"), comps.get("sub_premise")):
+        add(_clean_name(raw))
+    area_values = {str(comps.get(k) or "").strip().lower() for k in _AREA_KEYS}
+    # Only the first three parts: landmarks ("Wipro Corporate Office", "RRS
+    # Global School") come after the building, and a landmark must not be
+    # taken as the destination.
+    for part in str(address or "").split(",")[:3]:
+        name = _clean_name(part)
+        if not name or len(name.split()) < 2:
+            continue
+        words = {w.lower() for w in re.findall(r"[A-Za-z]+", name)}
+        if (words & _AREA_WORDS or name.lower() in area_values
+                or name.split()[0].lower() in _LANDMARK_LEADS):
+            continue
+        add(name)
+    return names
 
 
 def build_building_query(components):

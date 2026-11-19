@@ -14,6 +14,7 @@ import requests
 from rapidfuzz import fuzz
 
 from app.config import (
+    COMPOUND_SPREAD_M,
     GOOGLE_MAPS_API_KEY,
     PLACES_CANDIDATE_PAGE_SIZE,
     PLACES_SEARCH_URL,
@@ -200,30 +201,111 @@ def _max_spread_m(places):
     return spread
 
 
+def label_name_score(label_name, place_name):
+    """0-100: how much a Places name looks like the building name on the label.
+    building_name_similarity (spelling tolerant) OR a word-level match: at
+    least two meaningful words of the label name, and at least 75% of them,
+    each appear (spelling tolerant) in the place's name - "Bluebell Klassik" ~
+    "Klassik Landmark Bluebell Tower", "Jasper Oion The Woods of East" ~
+    "Odion The Woods of East Phase 4". One shared word is never enough
+    ("Wipro" must not match "Wipro Technologies")."""
+    score = building_name_similarity(label_name, place_name)
+    label_words = _name_key(label_name).split()
+    place_words = _name_key(place_name).split()
+    if len(label_words) >= 2 and place_words:
+        hits = sum(
+            1 for w in label_words
+            if max(fuzz.ratio(w, p) for p in place_words) >= 80
+        )
+        if hits >= 2 and hits / len(label_words) >= 0.75:
+            score = max(score, 90)
+    return score
+
+
+def _name_matches(in_area, match_names):
+    """[(score, place)] for in-pincode results (not areas/roads) whose name
+    resembles a name on the label (similarity >= BUILDING_NAME_MIN_SIMILARITY)."""
+    out = []
+    for place in in_area:
+        if is_area_level(place):
+            continue
+        name = (place.get("displayName") or {}).get("text")
+        score = max((label_name_score(n, name) for n in match_names), default=0)
+        if score >= BUILDING_NAME_MIN_SIMILARITY:
+            out.append((score, place))
+    return out
+
+
+def _best_of_compound(matches):
+    """Highest name score; ties go to the result nearest the group's centre."""
+    from app.services.tsp import haversine_distance
+
+    lats = [p["location"]["latitude"] for _s, p in matches]
+    lons = [p["location"]["longitude"] for _s, p in matches]
+    clat, clon = sum(lats) / len(lats), sum(lons) / len(lons)
+    return max(
+        matches,
+        key=lambda m: (m[0], -haversine_distance(
+            clat, clon, m[1]["location"]["latitude"], m[1]["location"]["longitude"])),
+    )[1]
+
+
+def classify_places_ex(places, address_pincode, use_v2, match_names=None):
+    """classify_places plus name matching. Returns
+    (place, resolution, shown_places, name_state).
+
+    Only the old "several results far apart" case (MULTI_CANDIDATE) looks at
+    names, when `match_names` (names on the label) is given:
+      "one"      exactly one result is named like the label -> CONFIDENT
+      "compound" several are, all within COMPOUND_SPREAD_M (towers, phases,
+                 gates, duplicate listings) -> CONFIDENT, best-named one
+      "far"      several, farther apart -> MULTI_CANDIDATE listing ONLY them
+      "none"     none is named like the label (a landmark or random places);
+                 the caller retries by building name, else keeps MULTI_CANDIDATE
+    name_state is None when names were not used; shown_places is None unless
+    the candidate list should be limited.
+    """
+    if not places:
+        return None, ZERO_RESULTS, None, None
+    if not use_v2:
+        return places[0], _legacy_resolution(places[0], address_pincode), None, None
+
+    located = [p for p in places if p.get("location")]
+    if not located:
+        return places[0], ZERO_RESULTS, None, None   # "found but no coordinates"
+    in_area = (
+        [p for p in located if _place_pincode(p) == address_pincode]
+        if address_pincode else located
+    )
+    if not in_area:
+        return located[0], PINCODE_MISMATCH, None, None
+    if len(in_area) == 1 or _max_spread_m(in_area) <= SAME_PLACE_SPREAD_M:
+        return in_area[0], CONFIDENT, None, None
+    if not match_names:
+        return in_area[0], MULTI_CANDIDATE, None, None
+
+    matches = _name_matches(in_area, match_names)
+    if not matches:
+        return in_area[0], MULTI_CANDIDATE, None, "none"
+    if len(matches) == 1:
+        return matches[0][1], CONFIDENT, None, "one"
+    matched_places = [p for _s, p in sorted(matches, key=lambda m: -m[0])]
+    best = _best_of_compound(matches)
+    if _max_spread_m(matched_places) <= COMPOUND_SPREAD_M:
+        return best, CONFIDENT, None, "compound"
+    return best, MULTI_CANDIDATE, matched_places, "far"
+
+
 def classify_places(places, address_pincode, use_v2):
     """Pick a candidate and classify it. Returns (place, resolution).
 
     Flag off: today's pick (places[0]) with CONFIDENT / PINCODE_MISMATCH.
     Flag on:  prefer candidates in the address's pincode; several of them more
               than SAME_PLACE_SPREAD_M apart -> MULTI_CANDIDATE (first one kept).
+    Name matching (classify_places_ex) is opt-in and not used here.
     """
-    if not places:
-        return None, ZERO_RESULTS
-    if not use_v2:
-        return places[0], _legacy_resolution(places[0], address_pincode)
-
-    located = [p for p in places if p.get("location")]
-    if not located:
-        return places[0], ZERO_RESULTS          # "found but no coordinates"
-    in_area = (
-        [p for p in located if _place_pincode(p) == address_pincode]
-        if address_pincode else located
-    )
-    if not in_area:
-        return located[0], PINCODE_MISMATCH
-    if len(in_area) == 1 or _max_spread_m(in_area) <= SAME_PLACE_SPREAD_M:
-        return in_area[0], CONFIDENT
-    return in_area[0], MULTI_CANDIDATE
+    place, resolution, _shown, _state = classify_places_ex(places, address_pincode, use_v2)
+    return place, resolution
 
 
 MAX_STORED_CANDIDATES = 5
@@ -253,7 +335,7 @@ def _candidate_summaries(places, address_pincode):
     ]
 
 
-def _search_and_classify(query, address_pincode, use_v2, max_retries):
+def _search_and_classify(query, address_pincode, use_v2, max_retries, match_names=None):
     """(result, error_reason, error_code, resolution) for one Places query.
 
     With use_v2, the returned result also carries `candidates`: every
@@ -275,7 +357,8 @@ def _search_and_classify(query, address_pincode, use_v2, max_retries):
             ZERO_RESULTS,
         )
 
-    place, resolution = classify_places(places, address_pincode, use_v2)
+    place, resolution, shown, name_state = classify_places_ex(
+        places, address_pincode, use_v2, match_names)
 
     if not place.get("location"):
         return (
@@ -287,7 +370,9 @@ def _search_and_classify(query, address_pincode, use_v2, max_retries):
 
     result = _build_result(place, query, address_pincode)
     if use_v2:
-        result["candidates"] = _candidate_summaries(places, address_pincode)
+        result["candidates"] = _candidate_summaries(shown or places, address_pincode)
+        if name_state == "none":
+            result["_no_name_match"] = True     # popped by places_search_classified
     return result, None, None, resolution
 
 
@@ -388,7 +473,7 @@ def _building_retry(result, building_query, address_pincode, max_retries):
 
 def places_search_classified(address: str, use_v2: bool = False,
                              retry_address=None, max_retries: int = 3,
-                             building_query=None):
+                             building_query=None, match_names=None):
     """Resolve one address and classify the result.
 
     Returns (result, error_reason, error_code, resolution, source), source
@@ -405,8 +490,22 @@ def places_search_classified(address: str, use_v2: bool = False,
     pincode = extract_pincode(address)
 
     result, error_reason, error_code, resolution = _search_and_classify(
-        address, pincode, use_v2, max_retries,
+        address, pincode, use_v2, max_retries, match_names=match_names,
     )
+    if result is not None and result.pop("_no_name_match", False):
+        # Several results, none named like the label (a landmark, or random
+        # places around an area name): try the building by name. With no
+        # clear hit the answer stays exactly as before (Several matches).
+        if building_query:
+            try:
+                better = _building_retry(result, building_query, pincode, max_retries)
+            except Exception:
+                logger.exception("Building retry failed for '%s'", address[:60])
+                better = None
+            if better is not None:
+                return better, None, None, CONFIDENT, SOURCE_PLACES_RETRY
+        logger.info("No result named like the label for '%s'; keeping Several matches", address[:60])
+        return result, None, None, resolution, SOURCE_PLACES
     if result is not None:
         # Area/road-only answer and the label names a building: try the
         # building by name (see _building_retry). Never fails the geocode.
