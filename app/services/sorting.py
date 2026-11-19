@@ -3,6 +3,8 @@
 import logging
 from collections import defaultdict
 
+from app.db import feature_flags
+
 from app.db.bigquery import (
     deactivate_duplicate_routing_rows,
     fetch_active_rows_for_drs,
@@ -17,7 +19,33 @@ logger = logging.getLogger(__name__)
 LOCKED_STATUSES = {"Delivered", "Not_Delivered"}  # driver already visited these — do not renumber
 
 
-def compute_groups_and_sequence(rows, drs_no, start_meta):
+def _road_distance_enabled():
+    try:
+        return feature_flags.road_distance_routing()
+    except Exception:
+        logger.exception("roadDistanceRouting flag check failed; using straight lines")
+        return False
+
+
+def _road_matrix(start_lat, start_lon, stops, stats_out):
+    """Road-distance table over [start] + stops, or None to use straight
+    lines. Never raises: any failure means straight lines, as before."""
+    try:
+        from app.services.road_matrix import build_distance_matrix
+
+        points = [(float(start_lat), float(start_lon))] + [
+            (float(r.latitude), float(r.longitude)) for r in stops]
+        matrix, stats = build_distance_matrix(points)
+        stats_out.update(stats)
+        stats_out["distance_source"] = "road" if stats["road_pairs"] else "straight_line"
+        return matrix if stats["road_pairs"] else None
+    except Exception:
+        logger.exception("Road distance matrix failed; using straight lines")
+        stats_out["distance_source"] = "straight_line"
+        return None
+
+
+def compute_groups_and_sequence(rows, drs_no, start_meta, use_road=False, stats_out=None):
     """Solves the route order with OR-Tools, then assigns:
       - geohash_group_id: rows are still clustered by locality geohash
       - planned_sequence_order: the row's position in the overall solved route
@@ -74,7 +102,14 @@ def compute_groups_and_sequence(rows, drs_no, start_meta):
         start_lon = usable_pending[0].longitude
         start_addr = start_addr or "UNKNOWN"
 
-    ordered_pending = solve_route_order(start_lat, start_lon, usable_pending)
+    # Road distances (featureFlags/roadDistanceRouting): the 11 -> 12 -> 13
+    # case, where 12 looks close in a straight line but is far by road.
+    matrix = None
+    if use_road:
+        matrix = _road_matrix(start_lat, start_lon, usable_pending,
+                              stats_out if stats_out is not None else {})
+    ordered_pending = solve_route_order(start_lat, start_lon, usable_pending,
+                                        distance_matrix_m=matrix)
 
     # Slots not held by a delivered parcel, in ascending order.
     remaining_slots = [s for s in range(1, total_slots + 1) if s not in occupied_slots]
@@ -125,10 +160,19 @@ def run_sorting_pipeline(drs_no):
             "message": f"No active consignments found in BQ for DRS {drs_no}.",
         }
 
-    updates = compute_groups_and_sequence(rows, drs_no, start_meta or {})
+    use_road = _road_distance_enabled()
+    road_stats = {}
+    updates = compute_groups_and_sequence(rows, drs_no, start_meta or {},
+                                          use_road=use_road, stats_out=road_stats)
 
     if updates:
         write_group_assignments(updates)
         upsert_routing_from_sorting(fetch_assigned_rows_for_drs(drs_no))
 
-    return {"optimized_count": len(updates)}
+    result = {"optimized_count": len(updates)}
+    if use_road:
+        result["distance_source"] = road_stats.get("distance_source", "straight_line")
+        result["road_distance"] = {k: road_stats[k] for k in (
+            "road_pairs", "from_cache", "from_api", "api_elements", "api_errors")
+            if k in road_stats}
+    return result

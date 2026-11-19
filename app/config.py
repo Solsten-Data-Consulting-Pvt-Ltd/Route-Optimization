@@ -42,6 +42,24 @@ FEATURE_FLAG_TTL_SECONDS = int(os.environ.get("FEATURE_FLAG_TTL_SECONDS", "45"))
 PLACES_CANDIDATE_PAGE_SIZE = 5
 SAME_PLACE_SPREAD_M = 300
 
+# Road distances for route sorting (featureFlags/roadDistanceRouting).
+# Google Routes API, Compute Route Matrix, TRAFFIC_UNAWARE (Essentials SKU).
+ROUTES_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+# Road distance is fetched only from each stop to its N nearest stops (by
+# straight line); the solver never links far-apart stops directly, so those
+# pairs use straight line x ROAD_DETOUR_FACTOR instead. Cuts API use ~75 %.
+ROAD_DISTANCE_NEIGHBOURS = 8
+ROAD_DETOUR_FACTOR = 1.4
+# Hard cap on billable matrix elements per optimize run (budget guard); pairs
+# beyond it use the straight-line estimate.
+ROAD_MAX_ELEMENTS_PER_RUN = 600
+ROAD_REQUEST_TIMEOUT_S = 10
+ROAD_MAX_PARALLEL_REQUESTS = 8
+# Cache of road distances between ~150 m cells (geohash-7), per direction.
+ROAD_CACHE_COLLECTION = "road_distance_cache"
+ROAD_CACHE_GEOHASH_LEN = 7
+ROAD_CACHE_TTL_DAYS = 30
+
 GEOHASH_LOCALITY_LEN = 5
 GEOHASH_BUILDING_LEN = 6
 MAX_ROWS_PER_MERGE = 500
