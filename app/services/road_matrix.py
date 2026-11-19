@@ -5,10 +5,18 @@ where 12 looks close to 11 but is far by road (a lake, a field, one entry to a
 layout) and the driver passes 13 to reach 12 and comes back. This module builds
 the optimizer's distance table from ROAD distances instead.
 
-Cost control (Google Routes API, Compute Route Matrix, Essentials):
-  * each point asks only for its ROAD_DISTANCE_NEIGHBOURS nearest points (one
-    origin x up to 8 destinations per request); far pairs use straight line x
-    ROAD_DETOUR_FACTOR, since the solver never links far stops directly;
+What is looked up (Google Routes API, Compute Route Matrix, Essentials):
+  * a DRS up to ROAD_FULL_MATRIX_MAX_POINTS points gets EVERY pair by road -
+    nothing is guessed. (With only nearest-neighbour lookups, the guessed far
+    pairs at straight line x 1.4 looked cheaper than real roads, which run
+    ~2x straight line around Carmelaram's lakes - DHRD20055, 19 Nov - and the
+    solver jumped through the guesses);
+  * a larger DRS asks for each point's ROAD_DISTANCE_NEIGHBOURS nearest
+    points, in both directions;
+  * any pair still not known (larger DRS, cap, API error, within one cell) is
+    estimated as straight line x this DRS's own typical road/straight ratio
+    from the pairs just looked up (ROAD_DETOUR_FACTOR when too few samples);
+Cost control:
   * results are cached in Firestore `road_distance_cache` per pair of ~150 m
     cells (geohash-7, per direction), so repeat areas cost nothing;
   * at most ROAD_MAX_ELEMENTS_PER_RUN elements per optimize run.
@@ -24,13 +32,20 @@ from datetime import datetime, timedelta, timezone
 import pygeohash as pgh
 import requests
 
+import statistics
+
 from app.config import (
     GOOGLE_MAPS_API_KEY,
     ROAD_CACHE_COLLECTION,
     ROAD_CACHE_GEOHASH_LEN,
     ROAD_CACHE_TTL_DAYS,
     ROAD_DETOUR_FACTOR,
+    ROAD_DETOUR_FACTOR_MAX,
+    ROAD_DETOUR_FACTOR_MIN,
+    ROAD_DETOUR_MIN_SAMPLES,
     ROAD_DISTANCE_NEIGHBOURS,
+    ROAD_FULL_MATRIX_MAX_POINTS,
+    ROAD_MAX_DESTINATIONS_PER_REQUEST,
     ROAD_MAX_ELEMENTS_PER_RUN,
     ROAD_MAX_PARALLEL_REQUESTS,
     ROAD_REQUEST_TIMEOUT_S,
@@ -169,43 +184,75 @@ def fetch_row(origin, destinations):
 # ---------------------------------------------------------------------------
 # The matrix
 # ---------------------------------------------------------------------------
+def _wanted_pairs(points):
+    """{origin index: [destination indexes]} to look up by road, and the mode.
+    Small DRS: every pair. Large DRS: nearest neighbours, both directions."""
+    n = len(points)
+    if n <= ROAD_FULL_MATRIX_MAX_POINTS:
+        return {i: [j for j in range(n) if j != i] for i in range(n)}, "full"
+    nearest = neighbour_pairs(points)
+    wanted = {i: set(js) for i, js in nearest.items()}
+    for i, js in nearest.items():
+        for j in js:
+            wanted[j].add(i)
+    return {i: sorted(js) for i, js in wanted.items()}, "nearest"
+
+
+def detour_factor(points, road_values):
+    """Typical road/straight-line ratio for this DRS from the pairs looked up
+    ({(i, j): metres}), clamped; ROAD_DETOUR_FACTOR with too few samples.
+    Very short pairs are left out (their ratio is noise)."""
+    ratios = []
+    for (i, j), metres in road_values.items():
+        straight = straight_line_m(points[i], points[j])
+        if straight >= 200:
+            ratios.append(metres / straight)
+    if len(ratios) < ROAD_DETOUR_MIN_SAMPLES:
+        return ROAD_DETOUR_FACTOR
+    return min(ROAD_DETOUR_FACTOR_MAX, max(ROAD_DETOUR_FACTOR_MIN, statistics.median(ratios)))
+
+
 def build_distance_matrix(points, max_elements=ROAD_MAX_ELEMENTS_PER_RUN):
     """Square matrix (metres, int) over `points` [(lat, lon), ...].
 
-    Neighbour pairs use road distance (cache first, then the API); every other
-    pair, and any pair the cache/API couldn't answer, uses the straight-line
-    estimate. Returns (matrix, stats).
+    Every pair (small DRS) or each point's nearest pairs (large DRS) use road
+    distance (cache first, then the API). Anything left - and any pair the
+    cache/API couldn't answer - is estimated from this DRS's own road/straight
+    ratio. Returns (matrix, stats).
     """
     n = len(points)
     cells = [_cell(p) for p in points]
-    matrix = [[0 if i == j else int(round(estimate_m(points[i], points[j])))
-               for j in range(n)] for i in range(n)]
     stats = {"road_pairs": 0, "from_cache": 0, "from_api": 0, "api_elements": 0,
              "estimated_pairs": 0, "api_errors": 0}
 
-    wanted = neighbour_pairs(points)
-    # Pairs inside one ~150 m cell are too short to be worth a lookup.
+    wanted, mode = _wanted_pairs(points)
+    stats["mode"] = mode
+    # Pairs inside one ~150 m cell share one cache key and are too short to
+    # be worth a lookup; they are estimated.
     needed = {(i, j) for i, js in wanted.items() for j in js if cells[i] != cells[j]}
 
+    road = {}  # (i, j) -> metres, every pair answered by road
     cached = cache_get({(cells[i], cells[j]) for i, j in needed})
     to_fetch = {}
     for i, j in sorted(needed):
         key = (cells[i], cells[j])
         if key in cached:
-            matrix[i][j] = int(round(cached[key]))
+            road[(i, j)] = cached[key]
             stats["from_cache"] += 1
         else:
             to_fetch.setdefault(i, []).append(j)
 
-    # Respect the per-run budget: whole origin rows, nearest first, in order.
+    # Respect the per-run budget: whole origin rows, in order; each row split
+    # into requests of at most ROAD_MAX_DESTINATIONS_PER_REQUEST destinations.
     jobs, budget = [], max_elements
     for i in sorted(to_fetch):
         js = to_fetch[i]
         if len(js) > budget:
             break
-        jobs.append((i, js))
+        for start in range(0, len(js), ROAD_MAX_DESTINATIONS_PER_REQUEST):
+            jobs.append((i, js[start:start + ROAD_MAX_DESTINATIONS_PER_REQUEST]))
         budget -= len(js)
-    skipped = sum(len(js) for i, js in to_fetch.items()) - sum(len(js) for _, js in jobs)
+    skipped = sum(len(js) for js in to_fetch.values()) - sum(len(js) for _, js in jobs)
     if skipped:
         logger.warning("Road matrix: element cap %d reached; %d pair(s) use the estimate",
                        max_elements, skipped)
@@ -229,11 +276,23 @@ def build_distance_matrix(points, max_elements=ROAD_MAX_ELEMENTS_PER_RUN):
                 for pos, j in enumerate(js):
                     if pos in row:
                         metres, seconds = row[pos]
-                        matrix[i][j] = int(round(metres))
+                        road[(i, j)] = metres
                         new_cache[(cells[i], cells[j])] = (metres, seconds)
                         stats["from_api"] += 1
     cache_put(new_cache)
 
-    stats["road_pairs"] = stats["from_cache"] + stats["from_api"]
+    factor = detour_factor(points, road)
+    stats["detour_factor"] = round(factor, 2)
+    matrix = [[0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if (i, j) in road:
+                matrix[i][j] = int(round(road[(i, j)]))
+            else:
+                matrix[i][j] = int(round(straight_line_m(points[i], points[j]) * factor))
+
+    stats["road_pairs"] = len(road)
     stats["estimated_pairs"] = n * (n - 1) - stats["road_pairs"]
     return matrix, stats

@@ -141,15 +141,47 @@ class CostControlTests(unittest.TestCase):
     def many(self, n=20):
         return {f"C{i:02d}": (12.88 + (i % 5) * 0.01, 77.62 + (i // 5) * 0.012) for i in range(n)}
 
-    def test_only_nearest_neighbours_one_origin_per_request(self):
-        pts = [HUB] + list(self.many().values())
+    def test_small_drs_gets_every_pair_by_road_nothing_guessed(self):
+        pts = [HUB] + list(self.many().values())   # 21 points, all in different cells
         with Patched() as p:
-            _, stats = road_matrix.build_distance_matrix(pts)
+            m, stats = road_matrix.build_distance_matrix(pts)
+        self.assertEqual(stats["mode"], "full")
+        self.assertEqual(stats["road_pairs"], len(pts) * (len(pts) - 1))
+        self.assertEqual(stats["estimated_pairs"], 0)
         for call in p.api.calls:
             self.assertEqual(len(call["body"]["origins"]), 1)
-            self.assertLessEqual(len(call["body"]["destinations"]), 8)
-        self.assertLessEqual(stats["api_elements"], len(pts) * 8)
-        self.assertLess(stats["api_elements"], len(pts) * (len(pts) - 1) / 2)
+            self.assertLessEqual(len(call["body"]["destinations"]),
+                                 road_matrix.ROAD_MAX_DESTINATIONS_PER_REQUEST)
+        self.assertEqual(m[0][1], int(road(pts[0], pts[1])))
+
+    def test_large_drs_asks_nearest_neighbours_in_both_directions(self):
+        pts = [HUB] + list(self.many(30).values())
+        with patch.object(road_matrix, "ROAD_FULL_MATRIX_MAX_POINTS", 10), Patched() as p:
+            _, stats = road_matrix.build_distance_matrix(pts)
+        self.assertEqual(stats["mode"], "nearest")
+        asked = {(tuple(c["body"]["origins"][0]["waypoint"]["location"]["latLng"].values()),
+                  tuple(d["waypoint"]["location"]["latLng"].values()))
+                 for c in p.api.calls for d in c["body"]["destinations"]}
+        for a, b in list(asked):
+            self.assertIn((b, a), asked)
+        self.assertLess(stats["api_elements"], len(pts) * (len(pts) - 1))
+
+    def test_guesses_use_this_drs_road_ratio_not_a_fixed_1_4(self):
+        # The DHRD20055 case: roads run ~2x straight line; a far pair guessed
+        # at 1.4x looked cheaper than real roads and the solver jumped through it.
+        pts = [HUB] + list(self.many(30).values())
+        class TwiceStraight(FakeRoutesApi):
+            def __call__(self, url, headers=None, json=None, timeout=None):
+                resp = super().__call__(url, headers, json, timeout)
+                for el in resp.json.return_value:
+                    el["distanceMeters"] = int(el["distanceMeters"] / 1.2 * 2.0)
+                return resp
+        with patch.object(road_matrix, "ROAD_FULL_MATRIX_MAX_POINTS", 10), \
+             Patched(api=TwiceStraight()):
+            m, stats = road_matrix.build_distance_matrix(pts)
+        self.assertAlmostEqual(stats["detour_factor"], 2.0, places=1)
+        far = max(range(1, len(pts)), key=lambda j: straight(pts[0], pts[j]))
+        self.assertGreater(m[0][far], straight(pts[0], pts[far]) * 1.9)
 
     def test_second_run_is_served_from_cache(self):
         pts = [HUB] + list(self.many().values())

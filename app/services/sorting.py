@@ -230,6 +230,7 @@ def run_sorting_pipeline(drs_no):
     if use_road:
         result["distance_source"] = road_stats.get("distance_source", "straight_line")
         result["road_distance"] = {k: road_stats[k] for k in (
-            "road_pairs", "from_cache", "from_api", "api_elements", "api_errors")
+            "mode", "road_pairs", "estimated_pairs", "detour_factor",
+            "from_cache", "from_api", "api_elements", "api_errors")
             if k in road_stats}
     return result
