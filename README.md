@@ -102,6 +102,21 @@ That is the only reason `consignments_structured` is read. Note it is an
 **inner join**: a parcel present in `consignments_routing` but missing from
 `consignments_structured` is silently skipped and never sorted.
 
+#### Building-name retry (with `geocodeResolutionV2`)
+
+When Places answers only an area or a road (all result types are area-level:
+locality, sublocality, neighborhood, postal_code, route, ...) and the OCR
+components carry a building name (`premise` / `sub_premise`, flat and door
+numbers stripped), one more Places search is made with
+`"<building>, <locality>, <PIN>"`. A candidate is taken only if it is a
+building/business, its name is clearly the same (spelling-tolerant similarity
+>= 75, ignoring "the", "of", "apartments", spacing), it is in the same PIN code
+and within 3 km of the first answer. Otherwise the first answer is kept. The
+source stays `places_retry` ("from Google"); no new status or badge.
+
+Why: SMG9041167 (dev, 19 Nov) - handwritten "Mana Karmel" read as "Manu
+Kurmel"; Places returned "Carmelaram, Hadosiddapura" ~700 m away as CONFIDENT.
+
 #### Re-optimize after the driver has started (always on)
 
 When some stops are already Delivered / Not_Delivered, the remaining stops are

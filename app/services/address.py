@@ -96,3 +96,50 @@ def build_retry_address(receiver_address, components=None):
     text = re.sub(r"\s*,\s*(,\s*)+", ", ", text).strip(" ,")
     original = normalize_to_single_line(receiver_address or "")
     return text if text and text != original else None
+
+
+# --- Building-name retry (geocoding.places_search_classified) -------------
+# Words that are unit labels, not part of a building's name.
+_UNIT_WORDS = {
+    "flat", "flats", "no", "door", "house", "floor", "flr", "wing", "block",
+    "tower", "plot", "unit", "shop", "room", "apt", "level", "ground", "gf",
+}
+
+
+def building_name_from_components(components):
+    """The building/complex name from the OCR address components, with flat,
+    door, floor and block numbers and labels removed: "8, Manu Kurmel" ->
+    "Manu Kurmel", "Flat 1002, Sai Avenue Block-2" -> "Sai Avenue". None when
+    nothing name-like is left."""
+    if not isinstance(components, dict):
+        return None
+    for key in ("premise", "sub_premise"):
+        raw = str(components.get(key) or "")
+        words = []
+        for token in re.split(r"[\s,/#:.-]+", raw):
+            if not token or any(ch.isdigit() for ch in token):
+                continue
+            if token.lower() in _UNIT_WORDS:
+                continue
+            words.append(token)
+        name = " ".join(words).strip()
+        if len(re.sub(r"[^A-Za-z]", "", name)) >= 3:
+            return name
+    return None
+
+
+def build_building_query(components):
+    """(query, building name) for the building-name retry, or None.
+    Query = building, locality, postal code - e.g. "Manu Kurmel, Hadosiddapura,
+    560035". Needs a building name and at least a locality or PIN code."""
+    building = building_name_from_components(components)
+    if not building:
+        return None
+    locality = str(components.get("locality") or components.get("sub_locality") or "").strip()
+    pincode = str(components.get("postal_code") or "").strip()
+    if not locality and not pincode:
+        return None
+    if locality and locality.lower() == building.lower():
+        return None
+    query = ", ".join(p for p in (building, locality, pincode) if p)
+    return query, building

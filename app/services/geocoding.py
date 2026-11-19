@@ -7,9 +7,11 @@ behind geocodeResolutionV2, up to 5 candidates plus one shortened retry).
 """
 
 import logging
+import re
 import time
 
 import requests
+from rapidfuzz import fuzz
 
 from app.config import (
     GOOGLE_MAPS_API_KEY,
@@ -289,8 +291,104 @@ def _search_and_classify(query, address_pincode, use_v2, max_retries):
     return result, None, None, resolution
 
 
+# --- Building-name retry ---------------------------------------------------
+# Google often answers an address whose building name is misspelt (handwritten
+# "Mana Karmel" read as "Manu Kurmel" - SMG9041167, DHRD20055) with just the
+# area ("Carmelaram, Hadosiddapura"), ~700 m off. When the answer is only an
+# area or a road and the label has a building name, search once more with
+# "building, locality, PIN" and take a candidate whose name is clearly the
+# same building in the same PIN code. Nothing changes on screen: the source
+# stays "places_retry" ("from Google"), and with no clear match the first
+# answer is kept as before.
+
+# Place types that mean "an area or a road", not a building or business.
+AREA_LEVEL_TYPES = {
+    "locality", "sublocality", "sublocality_level_1", "sublocality_level_2",
+    "sublocality_level_3", "neighborhood", "political", "postal_code",
+    "administrative_area_level_1", "administrative_area_level_2",
+    "administrative_area_level_3", "colloquial_area", "route", "intersection",
+    "geocode", "country",
+}
+BUILDING_NAME_MIN_SIMILARITY = 75
+BUILDING_MAX_DISTANCE_M = 3000
+
+_GENERIC_NAME_WORDS = {"the", "of", "apartment", "apartments", "apts", "apt",
+                       "residency", "enclave", "layout", "society", "homes"}
+
+
+def is_area_level(place):
+    types = set(place.get("types") or [])
+    return bool(types) and types <= AREA_LEVEL_TYPES
+
+
+def _name_key(text):
+    words = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    return " ".join(w for w in words if w not in _GENERIC_NAME_WORDS)
+
+
+def building_name_similarity(a, b):
+    """0-100. Spelling-tolerant ("Manu Kurmel" ~ "Mana Karmel") and ignores
+    generic words ("the", "of", "apartments") and spacing ("Century21")."""
+    ka, kb = _name_key(a), _name_key(b)
+    if not ka or not kb:
+        return 0
+    return max(fuzz.token_sort_ratio(ka, kb),
+               fuzz.ratio(ka.replace(" ", ""), kb.replace(" ", "")))
+
+
+def pick_building_candidate(places, building, address_pincode, near):
+    """The best candidate that is clearly `building`: a building/business (not
+    an area), name similarity >= BUILDING_NAME_MIN_SIMILARITY, in the address's
+    PIN code when both are known, and within BUILDING_MAX_DISTANCE_M of the
+    first answer `near` (lat, lon). None when no candidate qualifies."""
+    from app.services.tsp import haversine_distance
+
+    best, best_score = None, 0
+    for place in places or []:
+        loc = place.get("location") or {}
+        if loc.get("latitude") is None or loc.get("longitude") is None:
+            continue
+        if is_area_level(place):
+            continue
+        pin = _place_pincode(place)
+        if address_pincode and pin and pin != address_pincode:
+            continue
+        if near and near[0] is not None and haversine_distance(
+                near[0], near[1], loc["latitude"], loc["longitude"]) * 1000.0 > BUILDING_MAX_DISTANCE_M:
+            continue
+        score = building_name_similarity(building, (place.get("displayName") or {}).get("text"))
+        if score >= BUILDING_NAME_MIN_SIMILARITY and score > best_score:
+            best, best_score = place, score
+    return best
+
+
+def _building_retry(result, building_query, address_pincode, max_retries):
+    """Re-resolve an area-level `result` by building name. Returns the new
+    result dict, or None to keep `result`."""
+    if not building_query or result is None:
+        return None
+    query, building = building_query
+    places, _reason, _code = _search_places(query, max_retries, page_size=PLACES_CANDIDATE_PAGE_SIZE)
+    if not places:
+        return None
+    place = pick_building_candidate(
+        places, building, address_pincode or extract_pincode(query),
+        (result.get("latitude"), result.get("longitude")),
+    )
+    if place is None:
+        logger.info("Building retry for '%s': no clear match; keeping the area answer", building)
+        return None
+    logger.info("Building retry: '%s' resolved to '%s' instead of area '%s'", building,
+                (place.get("displayName") or {}).get("text"), result.get("formatted_address"))
+    new = _build_result(place, query, address_pincode)
+    if "candidates" in result:
+        new["candidates"] = _candidate_summaries(places, address_pincode)
+    return new
+
+
 def places_search_classified(address: str, use_v2: bool = False,
-                             retry_address=None, max_retries: int = 3):
+                             retry_address=None, max_retries: int = 3,
+                             building_query=None):
     """Resolve one address and classify the result.
 
     Returns (result, error_reason, error_code, resolution, source), source
@@ -310,6 +408,17 @@ def places_search_classified(address: str, use_v2: bool = False,
         address, pincode, use_v2, max_retries,
     )
     if result is not None:
+        # Area/road-only answer and the label names a building: try the
+        # building by name (see _building_retry). Never fails the geocode.
+        if use_v2 and building_query and set(result.get("types") or []) and \
+                set(result.get("types") or []) <= AREA_LEVEL_TYPES:
+            try:
+                better = _building_retry(result, building_query, pincode, max_retries)
+            except Exception:
+                logger.exception("Building retry failed for '%s'", address[:60])
+                better = None
+            if better is not None:
+                return better, None, None, CONFIDENT, SOURCE_PLACES_RETRY
         return result, None, None, resolution, SOURCE_PLACES
 
     if use_v2 and error_code == ERR_ADDRESS_NOT_FOUND and retry_address:
