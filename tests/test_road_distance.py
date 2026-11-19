@@ -226,7 +226,7 @@ class PipelineFlagTests(unittest.TestCase):
 
     def test_flag_off_is_todays_behaviour_and_calls_nothing(self):
         result, calls = self.run_pipeline(False)
-        self.assertEqual(result, {"optimized_count": 5})
+        self.assertEqual(result, {"optimized_count": 5, "planned_from": "hub"})
         self.assertEqual(calls, [])
 
     def test_flag_on_reports_road_distance_use(self):

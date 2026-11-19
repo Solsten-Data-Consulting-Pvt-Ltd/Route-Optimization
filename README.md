@@ -102,6 +102,21 @@ That is the only reason `consignments_structured` is read. Note it is an
 **inner join**: a parcel present in `consignments_routing` but missing from
 `consignments_structured` is silently skipped and never sorted.
 
+#### Re-optimize after the driver has started (always on)
+
+When some stops are already Delivered / Not_Delivered, the remaining stops are
+planned from the pin of the stop the driver finished **most recently**
+(`deliveredAt`, else `statusUpdatedAt`, on the 3PL `consignments` doc), not
+from the hub. Finished stops keep their numbers; the stored `starting_*`
+fields stay the hub. If nothing is finished, or the times can't be read, the
+hub is used as before. The sort response adds `planned_from`
+(`hub` / `last_completed:<consignmentId>`).
+
+Why: on DHRD10238 (18 Nov) a mid-route re-optimize planned from the hub, so
+two stops near the hub jumped to #7/#8 ahead of #9 where the driver was
+standing, and he had to skip them. Replaying that DRS from the last finished
+stop puts #9 next and keeps the two Odion stops together.
+
 #### Road distances (`featureFlags/roadDistanceRouting`, starts off)
 
 By default the optimizer uses straight-line distance between pins, so it can

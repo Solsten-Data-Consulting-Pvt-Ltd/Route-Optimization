@@ -183,6 +183,7 @@ python -m unittest discover -s tests                        # no GCP access need
 
 ## 6. Open items / next steps
 
+0. **Re-optimize from the last completed stop** (`feature/road-distance`, always on): a re-optimize after the driver has started plans the remaining stops from the stop he finished last instead of the hub. See README "Re-optimize after the driver has started".
 0. **Road distances in sorting** (`feature/road-distance`, flag `featureFlags/roadDistanceRouting`, off by default): fixes the 11 -> 12 -> 13 detour by using Google Routes API road distances (nearest 8 per stop, cached, capped, straight-line fallback). See README "Road distances". Needs Routes API enabled + budget alert before turning on.
 
 1. **Merge neighbouring pincodes** (2.3): rebase `feature/address-resolution-pincodes` onto `dev` and re-apply the neighbour-plus-phone rule in the new `drs_match`.
