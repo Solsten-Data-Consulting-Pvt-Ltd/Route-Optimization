@@ -41,6 +41,41 @@ FEATURE_FLAG_TTL_SECONDS = int(os.environ.get("FEATURE_FLAG_TTL_SECONDS", "45"))
 # Address resolution: Places candidates closer than this count as one place.
 PLACES_CANDIDATE_PAGE_SIZE = 5
 SAME_PLACE_SPREAD_M = 300
+# Results whose names match the label's building name and sit within this
+# distance of each other are one compound (towers, phases, gates, duplicate
+# listings), not "several matches".
+COMPOUND_SPREAD_M = 800
+
+# Road distances for route sorting (featureFlags/roadDistanceRouting).
+# Google Routes API, Compute Route Matrix, TRAFFIC_UNAWARE (Essentials SKU).
+ROUTES_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+# Large DRSs only (see ROAD_FULL_MATRIX_MAX_POINTS): road distance is fetched
+# from each stop to its N nearest stops (by straight line), in both directions;
+# other pairs are estimated (see the detour factor below).
+ROAD_DISTANCE_NEIGHBOURS = 12
+ROAD_DETOUR_FACTOR = 1.4
+# Any pair still estimated (large DRS, cap, API error) uses this DRS's own
+# typical road/straight-line ratio from the pairs just looked up, clamped to
+# this range; ROAD_DETOUR_FACTOR only when there are too few samples.
+ROAD_DETOUR_FACTOR_MIN = 1.3
+ROAD_DETOUR_FACTOR_MAX = 3.0
+ROAD_DETOUR_MIN_SAMPLES = 5
+# DRSs up to this many points (stops + start) get the FULL road matrix: every
+# pair is looked up, nothing is guessed (60 stops = 3,660 elements the first
+# time; repeats come from the cache). Larger DRSs fall back to each stop's
+# nearest ROAD_DISTANCE_NEIGHBOURS, both directions.
+ROAD_FULL_MATRIX_MAX_POINTS = 61
+# Destinations per Compute Route Matrix request (one origin each).
+ROAD_MAX_DESTINATIONS_PER_REQUEST = 25
+# Hard cap on billable matrix elements per optimize run (budget guard); pairs
+# beyond it use the estimate.
+ROAD_MAX_ELEMENTS_PER_RUN = 4000
+ROAD_REQUEST_TIMEOUT_S = 10
+ROAD_MAX_PARALLEL_REQUESTS = 8
+# Cache of road distances between ~150 m cells (geohash-7), per direction.
+ROAD_CACHE_COLLECTION = "road_distance_cache"
+ROAD_CACHE_GEOHASH_LEN = 7
+ROAD_CACHE_TTL_DAYS = 30
 
 GEOHASH_LOCALITY_LEN = 5
 GEOHASH_BUILDING_LEN = 6

@@ -24,6 +24,8 @@ from app.db.geocache import get_cached_geocode_with_outcome, save_to_cache
 from app.services import geocode_codes as codes
 from app.services.address import (
     build_geocode_address,
+    address_match_names,
+    build_building_query,
     build_retry_address,
     extract_pincode,
     normalize_to_single_line,
@@ -210,7 +212,8 @@ def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignm
 
 
 def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
-             consignment_id=None, use_v2=False, retry_address=None):
+             consignment_id=None, use_v2=False, retry_address=None, building_query=None,
+             match_names=None):
     """Resolve a pin. Order:
 
       1. DRS memo, executive-corrected entries only (a correction made in this
@@ -304,7 +307,8 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
     # 4. Places. Flag off -> exactly today's call and pick.
     if use_v2:
         geocode_result, error_reason, error_code, resolution, source = places_search_classified(
-            address, use_v2=True, retry_address=retry_address,
+            address, use_v2=True, retry_address=retry_address, building_query=building_query,
+            match_names=match_names,
         )
     else:
         geocode_result, error_reason, error_code = places_search_address(address)
@@ -425,6 +429,8 @@ def preview_geocode(receiver_name, receiver_address, drs_id=None, consignment_id
             geocode_address_str, lookup_address=receiver_address or None,
             drs_id=memo_drs_id, match_info=match_info, consignment_id=consignment_id or None,
             use_v2=use_v2, retry_address=retry_address,
+            building_query=build_building_query(address_components or doc_components),
+            match_names=address_match_names(address_components or doc_components, receiver_address),
         )
     )
 
@@ -702,6 +708,8 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                         build_retry_address(receiver_address, _components_of(receiver))
                         if use_v2 else None
                     ),
+                    building_query=build_building_query(_components_of(receiver)),
+                    match_names=address_match_names(_components_of(receiver), receiver_address),
                 ))
             if geocode_result is None and not resolution:
                 resolution = codes.resolution_for_error(error_code)

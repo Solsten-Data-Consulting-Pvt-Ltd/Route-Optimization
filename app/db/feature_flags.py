@@ -16,6 +16,7 @@ from app.db.clients import get_fs_client
 logger = logging.getLogger(__name__)
 
 FLAG_GEOCODE_RESOLUTION_V2 = "geocodeResolutionV2"
+FLAG_ROAD_DISTANCE_ROUTING = "roadDistanceRouting"
 
 _snapshot = {"loaded_at": 0.0, "flags": None}
 
@@ -51,6 +52,10 @@ def is_enabled(flag_id: str) -> bool:
 
 def geocode_resolution_v2() -> bool:
     return is_enabled(FLAG_GEOCODE_RESOLUTION_V2)
+
+
+def road_distance_routing() -> bool:
+    return is_enabled(FLAG_ROAD_DISTANCE_ROUTING)
 
 
 def reset_cache():

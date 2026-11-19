@@ -3,13 +3,19 @@
 import logging
 from collections import defaultdict
 
+from app.db import feature_flags
+
 from app.db.bigquery import (
     deactivate_duplicate_routing_rows,
     fetch_active_rows_for_drs,
     fetch_assigned_rows_for_drs,
     write_group_assignments,
 )
-from app.db.firestore import get_drs_starting_point, upsert_routing_from_sorting
+from app.db.firestore import (
+    get_completion_times,
+    get_drs_starting_point,
+    upsert_routing_from_sorting,
+)
 from app.services.tsp import solve_route_order
 
 logger = logging.getLogger(__name__)
@@ -17,7 +23,70 @@ logger = logging.getLogger(__name__)
 LOCKED_STATUSES = {"Delivered", "Not_Delivered"}  # driver already visited these — do not renumber
 
 
-def compute_groups_and_sequence(rows, drs_no, start_meta):
+def _road_distance_enabled():
+    try:
+        return feature_flags.road_distance_routing()
+    except Exception:
+        logger.exception("roadDistanceRouting flag check failed; using straight lines")
+        return False
+
+
+def _road_matrix(start_lat, start_lon, stops, stats_out):
+    """Road-distance table over [start] + stops, or None to use straight
+    lines. Never raises: any failure means straight lines, as before."""
+    try:
+        from app.services.road_matrix import build_distance_matrix
+
+        points = [(float(start_lat), float(start_lon))] + [
+            (float(r.latitude), float(r.longitude)) for r in stops]
+        matrix, stats = build_distance_matrix(points)
+        stats_out.update(stats)
+        stats_out["distance_source"] = "road" if stats["road_pairs"] else "straight_line"
+        return matrix if stats["road_pairs"] else None
+    except Exception:
+        logger.exception("Road distance matrix failed; using straight lines")
+        stats_out["distance_source"] = "straight_line"
+        return None
+
+
+def pick_restart_point(rows, completed_at):
+    """Where a re-optimize after the driver has started should plan from: the
+    pin of the stop he finished most recently (Delivered / Not_Delivered,
+    latest completion time). None when nothing is finished yet, or no
+    finished stop has both a pin and a known time - then the hub is used,
+    as before. Ties on time break by consignment id (repeatable)."""
+    best = None
+    for r in rows:
+        if getattr(r, "status", None) not in LOCKED_STATUSES:
+            continue
+        when = completed_at.get(r.consignmentId)
+        if when is None or r.latitude is None or r.longitude is None:
+            continue
+        key = (when, str(r.consignmentId))
+        if best is None or key > best[0]:
+            best = (key, r)
+    if best is None:
+        return None
+    r = best[1]
+    return {"latitude": float(r.latitude), "longitude": float(r.longitude),
+            "consignmentId": r.consignmentId}
+
+
+def _restart_point_for(rows, drs_no):
+    """Reads completion times for the finished stops and picks the restart
+    point. Never raises: any failure means the hub, as before."""
+    done_ids = [r.consignmentId for r in rows if getattr(r, "status", None) in LOCKED_STATUSES]
+    if not done_ids:
+        return None
+    try:
+        return pick_restart_point(rows, get_completion_times(done_ids))
+    except Exception:
+        logger.exception("Could not read completion times for DRS %s; planning from the hub", drs_no)
+        return None
+
+
+def compute_groups_and_sequence(rows, drs_no, start_meta, use_road=False, stats_out=None,
+                                restart_point=None):
     """Solves the route order with OR-Tools, then assigns:
       - geohash_group_id: rows are still clustered by locality geohash
       - planned_sequence_order: the row's position in the overall solved route
@@ -74,7 +143,27 @@ def compute_groups_and_sequence(rows, drs_no, start_meta):
         start_lon = usable_pending[0].longitude
         start_addr = start_addr or "UNKNOWN"
 
-    ordered_pending = solve_route_order(start_lat, start_lon, usable_pending)
+    # Re-optimize after the driver has started: plan the remaining stops from
+    # the stop he finished last, not from the hub (otherwise stops near the
+    # hub jump ahead of where he already is - DHRD10238, 18 Nov). The stored
+    # starting_* fields below stay the DRS's hub.
+    solve_lat, solve_lon = start_lat, start_lon
+    if restart_point:
+        solve_lat, solve_lon = restart_point["latitude"], restart_point["longitude"]
+        logger.info("DRS %s: planning remaining stops from last completed stop %s",
+                    drs_no, restart_point.get("consignmentId"))
+    if stats_out is not None:
+        stats_out["planned_from"] = (
+            f"last_completed:{restart_point.get('consignmentId')}" if restart_point else "hub")
+
+    # Road distances (featureFlags/roadDistanceRouting): the 11 -> 12 -> 13
+    # case, where 12 looks close in a straight line but is far by road.
+    matrix = None
+    if use_road:
+        matrix = _road_matrix(solve_lat, solve_lon, usable_pending,
+                              stats_out if stats_out is not None else {})
+    ordered_pending = solve_route_order(solve_lat, solve_lon, usable_pending,
+                                        distance_matrix_m=matrix)
 
     # Slots not held by a delivered parcel, in ascending order.
     remaining_slots = [s for s in range(1, total_slots + 1) if s not in occupied_slots]
@@ -125,10 +214,23 @@ def run_sorting_pipeline(drs_no):
             "message": f"No active consignments found in BQ for DRS {drs_no}.",
         }
 
-    updates = compute_groups_and_sequence(rows, drs_no, start_meta or {})
+    use_road = _road_distance_enabled()
+    road_stats = {}
+    restart_point = _restart_point_for(rows, drs_no)
+    updates = compute_groups_and_sequence(rows, drs_no, start_meta or {},
+                                          use_road=use_road, stats_out=road_stats,
+                                          restart_point=restart_point)
 
     if updates:
         write_group_assignments(updates)
         upsert_routing_from_sorting(fetch_assigned_rows_for_drs(drs_no))
 
-    return {"optimized_count": len(updates)}
+    result = {"optimized_count": len(updates),
+              "planned_from": road_stats.get("planned_from", "hub")}
+    if use_road:
+        result["distance_source"] = road_stats.get("distance_source", "straight_line")
+        result["road_distance"] = {k: road_stats[k] for k in (
+            "mode", "road_pairs", "estimated_pairs", "detour_factor",
+            "from_cache", "from_api", "api_elements", "api_errors")
+            if k in road_stats}
+    return result

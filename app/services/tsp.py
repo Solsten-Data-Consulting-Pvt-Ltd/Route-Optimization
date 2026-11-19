@@ -32,7 +32,14 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return radius_km * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def solve_route_order(hub_lat, hub_lon, rows):
+def solve_route_order(hub_lat, hub_lon, rows, distance_matrix_m=None):
+    """Order `rows` as an open path starting at (hub_lat, hub_lon).
+
+    distance_matrix_m: optional square table in metres over [hub] + rows
+    (index 0 = hub, i = rows[i-1]), e.g. road distances from
+    app/services/road_matrix.py. Without it, straight-line distance is used,
+    exactly as before.
+    """
     n = len(rows)
     if n == 0:
         return []
@@ -54,6 +61,9 @@ def solve_route_order(hub_lat, hub_lon, rows):
         lat_i, lon_i = node_latlon(i)
         for j in range(num_nodes):
             if i == j or j == dummy_end_node:
+                continue
+            if distance_matrix_m is not None:
+                distance_matrix[i][j] = int(distance_matrix_m[i][j])
                 continue
             lat_j, lon_j = node_latlon(j)
             distance_matrix[i][j] = int(round(haversine_distance(lat_i, lon_i, lat_j, lon_j) * 1000))
