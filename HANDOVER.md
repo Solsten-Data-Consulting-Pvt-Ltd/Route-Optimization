@@ -183,6 +183,9 @@ python -m unittest discover -s tests                        # no GCP access need
 
 ## 6. Open items / next steps
 
+0. **Re-optimize from the last completed stop** (`feature/road-distance`, always on): a re-optimize after the driver has started plans the remaining stops from the stop he finished last instead of the hub. See README "Re-optimize after the driver has started".
+0. **Road distances in sorting** (`feature/road-distance`, flag `featureFlags/roadDistanceRouting`, off by default): fixes the 11 -> 12 -> 13 detour by using Google Routes API road distances (nearest 8 per stop, cached, capped, straight-line fallback). See README "Road distances". Needs Routes API enabled + budget alert before turning on.
+
 1. **Merge neighbouring pincodes** (2.3): rebase `feature/address-resolution-pincodes` onto `dev` and re-apply the neighbour-plus-phone rule in the new `drs_match`.
 2. **Port the §5.5 evaluation onto `dev`** (2.4), then do a first run on dev.
 3. **Delivery GPS as labels.** Drivers don't record reason codes yet. Delivery GPS (delivered near the pin, or repeat deliveries agreeing) would give many more right answers. This needs the exact field path for the delivery location in Firestore `consignments`.

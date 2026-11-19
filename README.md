@@ -102,6 +102,48 @@ That is the only reason `consignments_structured` is read. Note it is an
 **inner join**: a parcel present in `consignments_routing` but missing from
 `consignments_structured` is silently skipped and never sorted.
 
+#### Re-optimize after the driver has started (always on)
+
+When some stops are already Delivered / Not_Delivered, the remaining stops are
+planned from the pin of the stop the driver finished **most recently**
+(`deliveredAt`, else `statusUpdatedAt`, on the 3PL `consignments` doc), not
+from the hub. Finished stops keep their numbers; the stored `starting_*`
+fields stay the hub. If nothing is finished, or the times can't be read, the
+hub is used as before. The sort response adds `planned_from`
+(`hub` / `last_completed:<consignmentId>`).
+
+Why: on DHRD10238 (18 Nov) a mid-route re-optimize planned from the hub, so
+two stops near the hub jumped to #7/#8 ahead of #9 where the driver was
+standing, and he had to skip them. Replaying that DRS from the last finished
+stop puts #9 next and keeps the two Odion stops together.
+
+#### Road distances (`featureFlags/roadDistanceRouting`, starts off)
+
+By default the optimizer uses straight-line distance between pins, so it can
+order 11 -> 12 -> 13 when 12 looks close to 11 but is only reachable by road
+past 13 (a lake, a field, a layout with one entry). With the flag on, the
+distance table comes from **road distance** (`app/services/road_matrix.py`):
+
+- Google **Routes API, Compute Route Matrix**, `DRIVE`, `TRAFFIC_UNAWARE`
+  (Essentials SKU), with the existing `GOOGLE_MAPS_API_KEY`.
+- Only each stop's `ROAD_DISTANCE_NEIGHBOURS` (8) nearest stops are looked up,
+  one origin per request; far pairs use straight line x `ROAD_DETOUR_FACTOR`
+  (1.4). At most `ROAD_MAX_ELEMENTS_PER_RUN` (600) elements per optimize.
+- Results are cached in Firestore `road_distance_cache` for 30 days.
+- Any failure (API not enabled, quota, network) falls back to straight lines
+  for the pairs affected, so sorting never fails because of it.
+
+The response adds `distance_source` (`road` / `straight_line`) and
+`road_distance` (`road_pairs`, `from_cache`, `from_api`, `api_elements`,
+`api_errors`).
+
+**Setup before turning it on:** enable *Routes API* on the Google Cloud project
+of `GOOGLE_MAPS_API_KEY` (and allow it on the key if the key has API
+restrictions), set a billing budget alert and a daily quota cap on Compute
+Route Matrix, and add the Firestore TTL policy above. Cost at 1-5 DRS/day:
+inside the free monthly allowance (India price list: 70,000 Essentials
+elements/month).
+
 ### Typical order of operations
 
 ```
@@ -295,7 +337,8 @@ a `message` is returned.
 |-------|--------------|-----|
 | Firestore `consignments` | read | Source consignment documents (receiver name and address) |
 | Firestore `geocode_cache` | read + write | Previously geocoded addresses. Only entries flagged `verified: true` are reused; new entries are stored as `verified: false` |
-| Firestore `featureFlags` | read | 3PL's flag collection. `geocodeResolutionV2` (`enabled: true`) turns on address resolution; cached 45 s, missing/error = off |
+| Firestore `featureFlags` | read | 3PL's flag collection. `geocodeResolutionV2` turns on address resolution; `roadDistanceRouting` turns on road distances in sorting (below). `enabled: true` = on; cached 45 s, missing/error = off |
+| Firestore `road_distance_cache` | read + write | Road distances between ~150 m cells (geohash-7, per direction) from the Routes API, so repeat areas aren't paid for twice. Add a TTL policy on `expires_at` (30 days) |
 | Firestore `drs_address_memo` | read + write | One document per DRS: pins already resolved in that DRS, reused for later same-place consignments. Needs a TTL policy on `expires_at` |
 | Firestore `drs_cache_metrics` | write | One aggregate cache summary per DRS save run: exact/fuzzy hits, misses, API calls, and hit rate. This is written after the routing save and never blocks it. |
 | Firestore `drs_starting_point` | read | Hub/depot lat/lon and address, keyed by DRS number |

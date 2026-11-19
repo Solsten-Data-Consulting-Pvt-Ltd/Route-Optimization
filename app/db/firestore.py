@@ -57,6 +57,42 @@ def get_consignments_by_id(consignment_ids):
     return docs, not_found_ids
 
 
+def _to_datetime(value):
+    """Firestore Timestamp / datetime / ISO string -> aware datetime, else None."""
+    from datetime import datetime, timezone
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def get_completion_times(consignment_ids):
+    """{consignmentId: datetime} — when each consignment was last marked
+    Delivered / Not Delivered (deliveredAt, else statusUpdatedAt), read from
+    the 3PL `consignments` docs. Missing docs/fields are left out."""
+    ids = [cid for cid in dict.fromkeys(consignment_ids) if cid]
+    if not ids:
+        return {}
+    fs_client = get_fs_client()
+    collection = fs_client.collection(CONSIGNMENTS_COLLECTION)
+    out = {}
+    for doc in fs_client.get_all([collection.document(cid) for cid in ids]):
+        if not doc.exists:
+            continue
+        data = doc.to_dict() or {}
+        when = _to_datetime(data.get("deliveredAt")) or _to_datetime(data.get("statusUpdatedAt"))
+        if when is not None:
+            out[doc.id] = when
+    return out
+
+
 def get_drs_starting_point(drsno):
     """Fetch the depot/hub coordinates for a DRS from drs_starting_point.
 
