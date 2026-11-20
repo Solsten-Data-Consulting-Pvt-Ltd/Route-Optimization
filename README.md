@@ -165,16 +165,31 @@ distance table comes from **road distance** (`app/services/road_matrix.py`):
 
 - Google **Routes API, Compute Route Matrix**, `DRIVE`, `TRAFFIC_UNAWARE`
   (Essentials SKU), with the existing `GOOGLE_MAPS_API_KEY`.
-- Only each stop's `ROAD_DISTANCE_NEIGHBOURS` (8) nearest stops are looked up,
-  one origin per request; far pairs use straight line x `ROAD_DETOUR_FACTOR`
-  (1.4). At most `ROAD_MAX_ELEMENTS_PER_RUN` (600) elements per optimize.
+- DRSs up to `ROAD_FULL_MATRIX_MAX_POINTS` (101 points = 100 stops + start)
+  get **every pair by road**, nothing guessed. Bigger DRSs look up each stop's
+  `ROAD_DISTANCE_NEIGHBOURS` (12) nearest stops in both directions; other
+  pairs are straight line x this DRS's own road/straight ratio (clamped
+  1.3-3.0; `ROAD_DETOUR_FACTOR` 1.4 with too few samples).
+  Why 101 (was 61): on DHRD10230 (76 stops, 3 Nov 2026), scored in real road
+  km, nearest-12 + estimates planned 89.8 km, every pair by road 82.4 km.
+- One origin per request, nearest destinations first, asked in rounds (every
+  stop's nearest chunk, then the next), so a cap or a long rate limit only
+  loses far pairs. At most `ROAD_MAX_ELEMENTS_PER_RUN` (10,100) elements per
+  optimize; a fresh 76-stop DRS is 5,852, repeats come from the cache.
+- Google's per-minute element quota answers HTTP 429 (seen at ~3,300 elements
+  inside a minute). Those requests are retried every
+  `ROAD_RATE_LIMIT_PAUSE_S` (15 s) for at most `ROAD_RATE_LIMIT_MAX_WAIT_S`
+  (90 s) per run, then estimated. Raising the quota in Google Cloud avoids
+  the wait.
+- Search time: 1 s up to 10 stops, 3 s up to 50, **15 s above** (76 stops:
+  5 s gave 85.6 km, 15 s gave 82.4 km, 30 s nothing better).
 - Results are cached in Firestore `road_distance_cache` for 30 days.
-- Any failure (API not enabled, quota, network) falls back to straight lines
+- Any other failure (API not enabled, network) falls back to straight lines
   for the pairs affected, so sorting never fails because of it.
 
 The response adds `distance_source` (`road` / `straight_line`) and
 `road_distance` (`road_pairs`, `from_cache`, `from_api`, `api_elements`,
-`api_errors`).
+`api_errors`, `rate_limited`, `estimated_pairs`, `mode`, `detour_factor`).
 
 **Setup before turning it on:** enable *Routes API* on the Google Cloud project
 of `GOOGLE_MAPS_API_KEY` (and allow it on the key if the key has API

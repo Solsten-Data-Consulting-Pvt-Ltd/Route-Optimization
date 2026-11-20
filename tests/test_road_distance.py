@@ -42,10 +42,18 @@ def road(a, b):
 class FakeRoutesApi:
     """Stands in for requests.post to the Compute Route Matrix endpoint."""
 
-    def __init__(self, fail=False, no_route=False):
+    def __init__(self, fail=False, no_route=False, rate_limit=0):
         self.calls, self.fail, self.no_route = [], fail, no_route
+        self.rate_limit = rate_limit      # this many requests answer 429 first (-1 = always)
+        self.refused = 0
 
     def __call__(self, url, headers=None, json=None, timeout=None):
+        if self.rate_limit == -1 or self.refused < self.rate_limit:
+            self.refused += 1
+            resp = MagicMock(status_code=429)
+            resp.raise_for_status.side_effect = road_matrix.requests.HTTPError(
+                "429 Too Many Requests", response=resp)
+            return resp
         self.calls.append({"url": url, "headers": headers, "body": json})
         if self.fail:
             raise road_matrix.requests.ConnectionError("Routes API disabled")
@@ -166,6 +174,30 @@ class CostControlTests(unittest.TestCase):
             self.assertIn((b, a), asked)
         self.assertLess(stats["api_elements"], len(pts) * (len(pts) - 1))
 
+    def test_76_stop_drs_gets_every_pair_by_road(self):
+        # DHRD10230 (3 Nov): 76 stops. With nearest-12 + estimates it planned
+        # 89.8 road km; with every pair by road 82.4 km.
+        pts = [(12.85 + (i % 10) * 0.006, 77.60 + (i // 10) * 0.007) for i in range(77)]
+        wanted, mode = road_matrix._wanted_pairs(pts)
+        self.assertEqual(mode, "full")
+        self.assertEqual(sum(len(js) for js in wanted.values()), 77 * 76)
+        self.assertGreaterEqual(road_matrix.ROAD_MAX_ELEMENTS_PER_RUN, 77 * 76)
+
+    def test_cap_cuts_far_pairs_first_not_whole_stops(self):
+        pts = [HUB] + list(self.many(12).values())
+        n = len(pts)
+        with patch.object(road_matrix, "ROAD_MAX_DESTINATIONS_PER_REQUEST", 3), Patched() as p:
+            _, stats = road_matrix.build_distance_matrix(pts, max_elements=3 * n)
+        self.assertEqual(stats["api_elements"], 3 * n)
+        origins = set()
+        for c in p.api.calls:
+            o = tuple(c["body"]["origins"][0]["waypoint"]["location"]["latLng"].values())
+            origins.add(o)
+            dests = [tuple(d["waypoint"]["location"]["latLng"].values()) for d in c["body"]["destinations"]]
+            nearest = sorted((q for q in pts if q != o), key=lambda q: straight(o, q))[:3]
+            self.assertEqual(sorted(dests), sorted(nearest))
+        self.assertEqual(len(origins), n)     # every stop got its nearest pairs
+
     def test_guesses_use_this_drs_road_ratio_not_a_fixed_1_4(self):
         # The DHRD20055 case: roads run ~2x straight line; a far pair guessed
         # at 1.4x looked cheaper than real roads and the solver jumped through it.
@@ -219,6 +251,28 @@ class FallbackTests(unittest.TestCase):
         self.assertEqual(stats["distance_source"], "straight_line")
         self.assertGreater(stats["api_errors"], 0)
 
+    def test_rate_limited_requests_are_waited_out_not_estimated(self):
+        pts = [HUB] + list(CostControlTests().many(12).values())
+        with Patched(api=FakeRoutesApi(rate_limit=5)), \
+                patch.object(road_matrix.time, "sleep") as sleep:
+            _, stats = road_matrix.build_distance_matrix(pts)
+        self.assertEqual(stats["rate_limited"], 5)
+        self.assertEqual(stats["api_errors"], 0)
+        self.assertEqual(stats["estimated_pairs"], 0)
+        self.assertEqual(stats["road_pairs"], len(pts) * (len(pts) - 1))
+        sleep.assert_called()
+
+    def test_rate_limit_that_never_clears_falls_back_to_estimate(self):
+        with Patched(api=FakeRoutesApi(rate_limit=-1)), \
+                patch.object(road_matrix, "ROAD_RATE_LIMIT_MAX_WAIT_S", 0), \
+                patch.object(road_matrix.time, "sleep") as sleep:
+            m, stats = road_matrix.build_distance_matrix([HUB, STOPS["S10"]])
+        self.assertEqual(stats["road_pairs"], 0)
+        self.assertGreater(stats["api_errors"], 0)
+        self.assertEqual(stats["api_elements"], 0)
+        self.assertEqual(m[0][1], int(round(straight(HUB, STOPS["S10"]) * 1.4)))
+        sleep.assert_not_called()
+
     def test_no_route_found_uses_estimate(self):
         with Patched(api=FakeRoutesApi(no_route=True)):
             m, stats = road_matrix.build_distance_matrix([HUB, STOPS["S10"]])
@@ -233,6 +287,11 @@ class FallbackTests(unittest.TestCase):
 
 
 class TspMatrixTests(unittest.TestCase):
+    def test_big_drs_gets_a_longer_search(self):
+        from app.services import tsp
+        self.assertEqual(tsp._time_limit_for(19), 3)
+        self.assertEqual(tsp._time_limit_for(76), 15)
+
     def test_given_matrix_is_used(self):
         rows = [SimpleNamespace(latitude=0.0, longitude=0.001 * i, name=n)
                 for i, n in enumerate(["A", "B"], start=1)]
