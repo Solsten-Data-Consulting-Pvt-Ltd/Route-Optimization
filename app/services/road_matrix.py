@@ -19,13 +19,16 @@ What is looked up (Google Routes API, Compute Route Matrix, Essentials):
 Cost control:
   * results are cached in Firestore `road_distance_cache` per pair of ~150 m
     cells (geohash-7, per direction), so repeat areas cost nothing;
-  * at most ROAD_MAX_ELEMENTS_PER_RUN elements per optimize run.
+  * at most ROAD_MAX_ELEMENTS_PER_RUN elements per optimize run;
+  * Google's per-minute quota (HTTP 429) is waited out and retried, for at
+    most ROAD_RATE_LIMIT_MAX_WAIT_S per run, nearest pairs asked first.
 
 Never raises for API problems: any pair it can't get from the cache or the API
 falls back to the straight-line estimate, so routing always completes.
 """
 
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -48,6 +51,8 @@ from app.config import (
     ROAD_MAX_DESTINATIONS_PER_REQUEST,
     ROAD_MAX_ELEMENTS_PER_RUN,
     ROAD_MAX_PARALLEL_REQUESTS,
+    ROAD_RATE_LIMIT_MAX_WAIT_S,
+    ROAD_RATE_LIMIT_PAUSE_S,
     ROAD_REQUEST_TIMEOUT_S,
     ROUTES_MATRIX_URL,
 )
@@ -242,16 +247,22 @@ def build_distance_matrix(points, max_elements=ROAD_MAX_ELEMENTS_PER_RUN):
         else:
             to_fetch.setdefault(i, []).append(j)
 
-    # Respect the per-run budget: whole origin rows, in order; each row split
-    # into requests of at most ROAD_MAX_DESTINATIONS_PER_REQUEST destinations.
+    # Requests: one origin and at most ROAD_MAX_DESTINATIONS_PER_REQUEST of its
+    # destinations, nearest first. Jobs go in rounds - every origin's nearest
+    # chunk, then every origin's next chunk - so if the element cap or the
+    # rate-limit wait cuts the run short, what is missing are far pairs (the
+    # least useful) rather than whole stops.
+    chunks = {}
+    for i, js in to_fetch.items():
+        js = sorted(js, key=lambda j: (straight_line_m(points[i], points[j]), j))
+        chunks[i] = [js[k:k + ROAD_MAX_DESTINATIONS_PER_REQUEST]
+                     for k in range(0, len(js), ROAD_MAX_DESTINATIONS_PER_REQUEST)]
     jobs, budget = [], max_elements
-    for i in sorted(to_fetch):
-        js = to_fetch[i]
-        if len(js) > budget:
-            break
-        for start in range(0, len(js), ROAD_MAX_DESTINATIONS_PER_REQUEST):
-            jobs.append((i, js[start:start + ROAD_MAX_DESTINATIONS_PER_REQUEST]))
-        budget -= len(js)
+    for rnd in range(max((len(c) for c in chunks.values()), default=0)):
+        for i in sorted(chunks):
+            if rnd < len(chunks[i]) and len(chunks[i][rnd]) <= budget:
+                jobs.append((i, chunks[i][rnd]))
+                budget -= len(chunks[i][rnd])
     skipped = sum(len(js) for js in to_fetch.values()) - sum(len(js) for _, js in jobs)
     if skipped:
         logger.warning("Road matrix: element cap %d reached; %d pair(s) use the estimate",
@@ -264,10 +275,22 @@ def build_distance_matrix(points, max_elements=ROAD_MAX_ELEMENTS_PER_RUN):
         except Exception as e:     # network / HTTP / quota / disabled API
             return i, js, {}, e
 
+    def rate_limited(err):
+        response = getattr(err, "response", None)
+        return getattr(response, "status_code", None) == 429
+
     new_cache = {}
-    if jobs:
+    stats["rate_limited"] = 0
+    deadline = time.monotonic() + ROAD_RATE_LIMIT_MAX_WAIT_S
+    pending = jobs
+    while pending:
+        retry = []
         with ThreadPoolExecutor(max_workers=ROAD_MAX_PARALLEL_REQUESTS) as pool:
-            for i, js, row, err in pool.map(run, jobs):
+            for job, (i, js, row, err) in zip(pending, pool.map(run, pending)):
+                if err is not None and rate_limited(err):
+                    stats["rate_limited"] += 1      # refused, not billed
+                    retry.append(job)
+                    continue
                 stats["api_elements"] += len(js)
                 if err is not None:
                     stats["api_errors"] += 1
@@ -279,6 +302,17 @@ def build_distance_matrix(points, max_elements=ROAD_MAX_ELEMENTS_PER_RUN):
                         road[(i, j)] = metres
                         new_cache[(cells[i], cells[j])] = (metres, seconds)
                         stats["from_api"] += 1
+        if not retry:
+            break
+        wait = min(ROAD_RATE_LIMIT_PAUSE_S, deadline - time.monotonic())
+        if wait <= 0:
+            stats["api_errors"] += len(retry)
+            logger.warning("Road matrix: still rate-limited after %ds; %d request(s) use the estimate",
+                           ROAD_RATE_LIMIT_MAX_WAIT_S, len(retry))
+            break
+        logger.info("Road matrix: rate-limited on %d request(s); retrying in %.0fs", len(retry), wait)
+        time.sleep(wait)
+        pending = retry
     cache_put(new_cache)
 
     factor = detour_factor(points, road)
