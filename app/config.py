@@ -61,17 +61,28 @@ ROAD_DETOUR_FACTOR_MIN = 1.3
 ROAD_DETOUR_FACTOR_MAX = 3.0
 ROAD_DETOUR_MIN_SAMPLES = 5
 # DRSs up to this many points (stops + start) get the FULL road matrix: every
-# pair is looked up, nothing is guessed (60 stops = 3,660 elements the first
+# pair is looked up, nothing is guessed (76 stops = 5,852 elements the first
 # time; repeats come from the cache). Larger DRSs fall back to each stop's
 # nearest ROAD_DISTANCE_NEIGHBOURS, both directions.
-ROAD_FULL_MATRIX_MAX_POINTS = 61
+# Was 61. Measured on DHRD10230 (76 stops, 3 Nov 2026), scored in real road
+# km: nearest-12 + estimates 89.8 km vs the full matrix 82.4 km (+9%); a
+# longer search did not close the gap - the guessed pairs did.
+ROAD_FULL_MATRIX_MAX_POINTS = 101
 # Destinations per Compute Route Matrix request (one origin each).
 ROAD_MAX_DESTINATIONS_PER_REQUEST = 25
 # Hard cap on billable matrix elements per optimize run (budget guard); pairs
-# beyond it use the estimate.
-ROAD_MAX_ELEMENTS_PER_RUN = 4000
+# beyond it use the estimate. Covers a full matrix at ROAD_FULL_MATRIX_MAX_POINTS
+# (101 x 100 = 10,100).
+ROAD_MAX_ELEMENTS_PER_RUN = 10100
 ROAD_REQUEST_TIMEOUT_S = 10
 ROAD_MAX_PARALLEL_REQUESTS = 8
+# Google answers 429 (too many requests) past its per-minute element quota
+# (seen at ~3,300 elements inside a minute). Rate-limited requests are retried
+# after a pause, for at most this long in total per run, instead of quietly
+# using the estimate; whatever is still missing after that is estimated.
+# Kept well under 3PL's 3.5-minute timeout on the sort call.
+ROAD_RATE_LIMIT_MAX_WAIT_S = 90
+ROAD_RATE_LIMIT_PAUSE_S = 15
 # Cache of road distances between ~150 m cells (geohash-7), per direction.
 ROAD_CACHE_COLLECTION = "road_distance_cache"
 ROAD_CACHE_GEOHASH_LEN = 7

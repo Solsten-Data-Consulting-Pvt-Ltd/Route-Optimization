@@ -7,11 +7,13 @@ logger = logging.getLogger(__name__)
 
 
 def _time_limit_for(n_stops):
+    # Big DRSs need longer: on DHRD10230 (76 stops, full road matrix) 5 s gave
+    # 85.6 km and 15 s gave 82.4 km; 30 s found nothing better than 15 s.
     if n_stops <= 10:
         return 1
     if n_stops <= 50:
         return 3
-    return 5
+    return 15
 
 
 def haversine_distance(lat1, lon1, lat2, lon2):
