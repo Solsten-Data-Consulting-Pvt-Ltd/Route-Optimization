@@ -92,18 +92,23 @@ class CacheVerificationTests(unittest.TestCase):
         self.group.start()
         self.addCleanup(self.group.stop)
 
-    def test_one_drs_counts_once_and_two_distinct_visits_verify(self):
-        first = cache_verify.confirm("C1", observation("ignored"), "driver-1")
-        self.assertEqual((first["visitCount"], first["verified"]), (1, False))
-
-        # Another delivery in the same run is still one visit.
-        again = cache_verify.confirm("C2", observation("ignored"), "driver-1")
-        self.assertEqual((again["visitCount"], again["verified"]), (1, False))
-
-        self.routing["drsId"] = "DRS-2"
-        second = cache_verify.confirm("C3", observation("ignored"), "driver-2")
-        self.assertEqual((second["visitCount"], second["verified"]), (2, True))
+    def test_one_delivery_within_500_m_verifies(self):
+        # ~400 m north of the pin.
+        result = cache_verify.confirm("C1", observation("ignored", 12.0036, 77.0), "driver-1")
+        self.assertEqual((result["visitCount"], result["verified"]), (1, True))
         self.assertTrue(self.entry["verified"])
+
+    def test_delivery_beyond_500_m_does_not_verify(self):
+        # ~600 m north of the pin.
+        result = cache_verify.confirm("C1", observation("ignored", 12.0054, 77.0), "driver-1")
+        self.assertEqual((result["visitCount"], result["verified"]), (0, False))
+        self.assertFalse(self.entry["verified"])
+
+    def test_one_drs_still_counts_as_one_visit(self):
+        cache_verify.confirm("C1", observation("ignored"), "driver-1")
+        again = cache_verify.confirm("C2", observation("ignored"), "driver-1")
+        self.assertEqual(again["visitCount"], 1)
+        self.assertEqual(len(self.entry["observations"]), 1)
 
     def test_low_accuracy_observation_is_ignored(self):
         result = cache_verify.confirm("C1", observation("ignored", accuracy=101), "driver")
@@ -120,6 +125,17 @@ class CacheVerificationTests(unittest.TestCase):
         suggestion = cache_verify.suggested_pin(self.entry)
         self.assertEqual(suggestion["visit_count"], 3)
         self.assertGreater(suggestion["latitude"], 12.003)
+
+    def test_suggestion_stays_tight_while_verify_radius_is_500_m(self):
+        self.assertEqual(cache_verify.GEOCODE_CACHE_VERIFY_RADIUS_METERS, 500)
+        self.assertEqual(cache_verify.GEOCODE_CACHE_SUGGEST_RADIUS_METERS, 150)
+        # Three visits ~300 m apart do not agree on one spot.
+        self.entry["observations"] = [
+            observation("D1", 12.004, 77.0),
+            observation("D2", 12.0067, 77.0),
+            observation("D3", 12.0094, 77.0),
+        ]
+        self.assertIsNone(cache_verify.suggested_pin(self.entry))
 
     def test_correct_returns_existing_cross_drs_visit_count(self):
         self.entry["observations"] = [observation("D1"), observation("D2")]
