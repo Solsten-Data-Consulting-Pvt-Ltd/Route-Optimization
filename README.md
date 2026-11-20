@@ -752,6 +752,10 @@ Worth knowing before you debug something surprising:
 - **A delivered parcel with no existing sequence number** cannot hold a slot; it
   is logged as a warning and the numbering can end up not landing exactly on
   `1..N`.
-- **Nothing in this service sets `verified: true`** on a geocode cache entry.
-  That is an ops decision made outside the app, and until it is made the cached
-  address will not be reused.
+- **Auto-verify on delivery** (`POST /geocode-cache/confirm`, called by 3PL
+  for every delivered parcel): the entry becomes `verified: true` once
+  `GEOCODE_CACHE_MIN_VISITS` (1) separate DRS visit delivered within
+  `GEOCODE_CACHE_VERIFY_RADIUS_METERS` (500 m) of the pin. GPS worse than
+  100 m is ignored; parcels from one DRS count as one visit. Since 20 Nov 2026
+  (14-20 Nov it was 2 visits within 150 m). Suggested Pins still need 3
+  visits agreeing within `GEOCODE_CACHE_SUGGEST_RADIUS_METERS` (150 m).
