@@ -14,6 +14,7 @@ from app.config import (
     GEOCODE_CACHE_MAX_OBSERVATIONS,
     GEOCODE_CACHE_MAX_OBSERVATION_ACCURACY_METERS,
     GEOCODE_CACHE_MIN_VISITS,
+    GEOCODE_CACHE_SUGGEST_RADIUS_METERS,
     GEOCODE_CACHE_VERIFY_RADIUS_METERS,
 )
 from app.db import drs_memo
@@ -113,13 +114,13 @@ def suggested_pin(entry, observations=None):
             item for item in observations
             if _within(seed["latitude"], seed["longitude"],
                        item["latitude"], item["longitude"],
-                       GEOCODE_CACHE_VERIFY_RADIUS_METERS)
+                       GEOCODE_CACHE_SUGGEST_RADIUS_METERS)
         ]
         if len(cluster) < 3:
             continue
         latitude, longitude = _centroid(cluster)
         if _within(entry.get("latitude"), entry.get("longitude"), latitude, longitude,
-                   GEOCODE_CACHE_VERIFY_RADIUS_METERS):
+                   GEOCODE_CACHE_SUGGEST_RADIUS_METERS):
             continue
         candidate = {"latitude": latitude, "longitude": longitude, "visit_count": len(cluster)}
         if best is None or candidate["visit_count"] > best["visit_count"]:
