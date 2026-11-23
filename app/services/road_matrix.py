@@ -232,6 +232,7 @@ def build_distance_matrix(points, max_elements=ROAD_MAX_ELEMENTS_PER_RUN):
 
     wanted, mode = _wanted_pairs(points)
     stats["mode"] = mode
+    stats["points"] = n
     # Pairs inside one ~150 m cell share one cache key and are too short to
     # be worth a lookup; they are estimated.
     needed = {(i, j) for i, js in wanted.items() for j in js if cells[i] != cells[j]}
