@@ -393,6 +393,7 @@ a `message` is returned.
 | Firestore `geocode_cache` | read + write | Previously geocoded addresses. Only entries flagged `verified: true` are reused; new entries are stored as `verified: false` |
 | Firestore `featureFlags` | read | 3PL's flag collection. `geocodeResolutionV2` turns on address resolution; `roadDistanceRouting` turns on road distances in sorting (below). `enabled: true` = on; cached 45 s, missing/error = off |
 | Firestore `road_distance_cache` | read + write | Road distances between ~150 m cells (geohash-7, per direction) from the Routes API, so repeat areas aren't paid for twice. Add a TTL policy on `expires_at` (30 days) |
+| Firestore `routing_runs` | write | One doc per optimize run (`app/db/routing_runs.py`): points, distances needed, bought from Google (`from_api`), served from cache (`from_cache`), estimated, API errors. For reading the Routes API cost and cache savings per day. Add a TTL policy on `expire_at` (90 days). Best-effort, never affects the route |
 | Firestore `drs_address_memo` | read + write | One document per DRS: pins already resolved in that DRS, reused for later same-place consignments. Needs a TTL policy on `expires_at` |
 | Firestore `drs_cache_metrics` | write | One aggregate cache summary per DRS save run: exact/fuzzy hits, misses, API calls, and hit rate. This is written after the routing save and never blocks it. |
 | Firestore `drs_starting_point` | read | Hub/depot lat/lon and address, keyed by DRS number |

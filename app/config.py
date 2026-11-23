@@ -94,6 +94,12 @@ ROAD_RATE_LIMIT_PAUSE_S = 15
 ROAD_CACHE_COLLECTION = "road_distance_cache"
 ROAD_CACHE_GEOHASH_LEN = 7
 ROAD_CACHE_TTL_DAYS = 30
+# One small doc per optimize run (app/db/routing_runs.py): how many road
+# distances were needed, bought from Google, served from the cache or
+# estimated — so the Routes API cost and cache savings can be read per day.
+# Add a Firestore TTL policy on `expire_at`.
+ROUTING_RUNS_COLLECTION = "routing_runs"
+ROUTING_RUNS_TTL_DAYS = 90
 
 GEOHASH_LOCALITY_LEN = 5
 GEOHASH_BUILDING_LEN = 6

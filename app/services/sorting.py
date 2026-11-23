@@ -4,6 +4,7 @@ import logging
 from collections import defaultdict
 
 from app.db import feature_flags
+from app.db.routing_runs import record_routing_run
 
 from app.db.bigquery import (
     deactivate_duplicate_routing_rows,
@@ -230,7 +231,9 @@ def run_sorting_pipeline(drs_no):
     if use_road:
         result["distance_source"] = road_stats.get("distance_source", "straight_line")
         result["road_distance"] = {k: road_stats[k] for k in (
-            "mode", "road_pairs", "estimated_pairs", "detour_factor",
-            "from_cache", "from_api", "api_elements", "api_errors")
+            "mode", "points", "road_pairs", "estimated_pairs", "detour_factor",
+            "from_cache", "from_api", "api_elements", "api_errors", "rate_limited")
             if k in road_stats}
+    # Cost/cache log, one doc per run (app/db/routing_runs.py). Never raises.
+    record_routing_run(drs_no, result, road_stats)
     return result
