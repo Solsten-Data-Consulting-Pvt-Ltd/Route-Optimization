@@ -38,5 +38,8 @@ jobs:
           --no-allow-unauthenticated
           --timeout 300
           --min-instances 1
-          --update-env-vars BQ_PROJECT="$GCP_PROJECT_ID",FIRESTORE_PROJECT="$GCP_PROJECT_ID",BQ_DATASET=Hermes_Exports,BQ_TABLE=consignments_routing,BQ_STRUCTURED_TABLE=consignments_structured
-          --set-secrets GOOGLE_MAPS_API_KEY=google-maps-api-key:latest
+          --network default
+          --subnet default
+          --vpc-egress private-ranges-only
+          --update-env-vars BQ_PROJECT="$GCP_PROJECT_ID",FIRESTORE_PROJECT="$GCP_PROJECT_ID",BQ_DATASET=Hermes_Exports,BQ_TABLE=consignments_routing,BQ_STRUCTURED_TABLE=consignments_structured,OSRM_BASE_URL="${{ vars.OSRM_PROD_BASE_URL || 'http://10.160.0.2:5000' }}",ALERT_ENV_NAME=prod
+          --set-secrets GOOGLE_MAPS_API_KEY=google-maps-api-key:latest,ALERT_CHAT_WEBHOOK_URL=alert-chat-webhook-url:latest
