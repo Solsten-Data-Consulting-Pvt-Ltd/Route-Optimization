@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 FLAG_GEOCODE_RESOLUTION_V2 = "geocodeResolutionV2"
 FLAG_ROAD_DISTANCE_ROUTING = "roadDistanceRouting"
+# Where road distances come from once roadDistanceRouting is on: a document
+# {"value": "google" | "shadow" | "osrm"}. Anything else / missing = google.
+FLAG_ROAD_DISTANCE_PROVIDER = "roadDistanceProvider"
+ROAD_DISTANCE_PROVIDERS = ("google", "shadow", "osrm")
 
 _snapshot = {"loaded_at": 0.0, "flags": None}
 
@@ -56,6 +60,18 @@ def geocode_resolution_v2() -> bool:
 
 def road_distance_routing() -> bool:
     return is_enabled(FLAG_ROAD_DISTANCE_ROUTING)
+
+
+def road_distance_provider() -> str:
+    """"google" (default), "shadow" (Google routes, OSRM only compared) or
+    "osrm". A missing doc, an unknown value or any read error is "google", so a
+    Firestore problem can never switch the provider."""
+    try:
+        value = (_load_snapshot().get(FLAG_ROAD_DISTANCE_PROVIDER) or {}).get("value")
+    except Exception:
+        logger.exception("Feature flag check failed for %s", FLAG_ROAD_DISTANCE_PROVIDER)
+        return "google"
+    return value if value in ROAD_DISTANCE_PROVIDERS else "google"
 
 
 def reset_cache():

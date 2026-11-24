@@ -32,15 +32,51 @@ def _road_distance_enabled():
         return False
 
 
+def _road_provider():
+    try:
+        return feature_flags.road_distance_provider()
+    except Exception:
+        logger.exception("roadDistanceProvider flag check failed; using google")
+        return "google"
+
+
 def _road_matrix(start_lat, start_lon, stops, stats_out):
     """Road-distance table over [start] + stops, or None to use straight
-    lines. Never raises: any failure means straight lines, as before."""
-    try:
-        from app.services.road_matrix import build_distance_matrix
+    lines. Never raises: any failure means straight lines, as before.
 
+    Provider (featureFlags/roadDistanceProvider): "google" (default) as
+    before; "shadow" builds the Google table as before and only logs how far
+    OSRM is from it; "osrm" takes every pair from our OSRM server, with no
+    Google call. If OSRM cannot be used at all the DRS is planned on straight
+    lines and an alert goes to the project's Google Chat space."""
+    provider = _road_provider()
+    try:
         points = [(float(start_lat), float(start_lon))] + [
             (float(r.latitude), float(r.longitude)) for r in stops]
-        matrix, stats = build_distance_matrix(points)
+        if provider == "osrm":
+            from app.services import alerts, osrm
+
+            try:
+                matrix, stats = osrm.build_distance_matrix_osrm(points)
+            except Exception as e:
+                logger.exception("OSRM road matrix failed; using straight lines")
+                stats_out.update({"provider": "osrm", "osrm_errors": 1, "points": len(points),
+                                  "distance_source": "straight_line"})
+                alerts.send_alert(
+                    "osrm_matrix_failed",
+                    f"OSRM could not answer while optimizing a DRS ({e}). "
+                    "That DRS was planned on straight-line distances. Check the OSRM server.")
+                return None
+        else:
+            from app.services.road_matrix import build_distance_matrix
+
+            road = {} if provider == "shadow" else None
+            matrix, stats = build_distance_matrix(points, road_out=road)
+            stats["provider"] = provider
+            if provider == "shadow":
+                from app.services import osrm
+
+                stats.update(osrm.shadow_stats(points, road))
         stats_out.update(stats)
         stats_out["distance_source"] = "road" if stats["road_pairs"] else "straight_line"
         return matrix if stats["road_pairs"] else None
@@ -232,7 +268,8 @@ def run_sorting_pipeline(drs_no):
         result["distance_source"] = road_stats.get("distance_source", "straight_line")
         result["road_distance"] = {k: road_stats[k] for k in (
             "mode", "points", "road_pairs", "estimated_pairs", "detour_factor",
-            "from_cache", "from_api", "api_elements", "api_errors", "rate_limited")
+            "from_cache", "from_api", "api_elements", "api_errors", "rate_limited",
+            "provider", "osrm_errors", "snap_outliers")
             if k in road_stats}
     # Cost/cache log, one doc per run (app/db/routing_runs.py). Never raises.
     record_routing_run(drs_no, result, road_stats)

@@ -15,7 +15,13 @@ from app.config import ROUTING_RUNS_COLLECTION, ROUTING_RUNS_TTL_DAYS
 logger = logging.getLogger(__name__)
 
 _STAT_KEYS = ("mode", "points", "road_pairs", "estimated_pairs", "from_cache",
-              "from_api", "api_elements", "api_errors", "rate_limited", "detour_factor")
+              "from_api", "api_elements", "api_errors", "rate_limited", "detour_factor",
+              # OSRM (app/services/osrm.py): who supplied the distances, how it
+              # went, and in shadow mode how far OSRM was from Google.
+              "provider", "osrm_ms", "osrm_requests", "osrm_errors",
+              "osrm_unroutable_pairs", "snap_outliers", "shadow_pairs",
+              "shadow_median_ratio", "shadow_p90_ratio", "shadow_off_pairs",
+              "shadow_off_pct", "shadow_error")
 
 
 def build_routing_run(drs_no, result, road_stats, now=None):
@@ -45,9 +51,9 @@ def record_routing_run(drs_no, result, road_stats):
         from app.db.clients import get_fs_client
         doc = build_routing_run(drs_no, result, road_stats)
         get_fs_client().collection(ROUTING_RUNS_COLLECTION).add(doc)
-        logger.info("Routing run DRS %s: %s points, %s from Google, %s from cache, %s estimated",
-                    drs_no, doc.get("points"), doc.get("from_api"), doc.get("from_cache"),
-                    doc.get("estimated_pairs"))
+        logger.info("Routing run DRS %s (%s): %s points, %s from Google, %s from cache, %s estimated",
+                    drs_no, doc.get("provider", "google"), doc.get("points"), doc.get("from_api"),
+                    doc.get("from_cache"), doc.get("estimated_pairs"))
         return True
     except Exception:
         logger.exception("Could not record routing run for DRS %s", drs_no)
