@@ -31,7 +31,7 @@ def send_alert(key, text, force=False):
         logger.info("Alert %s suppressed (cooldown): %s", key, message)
         return False
     _last_sent[key] = now
-    logger.error("ALERT %s: %s", key, message)
+    (logger.info if key.endswith("_ok") else logger.error)("ALERT %s: %s", key, message)
     if not config.ALERT_CHAT_WEBHOOK_URL:
         return False
     try:

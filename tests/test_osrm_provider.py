@@ -305,6 +305,40 @@ class HealthTests(unittest.TestCase):
     def setUp(self):
         from app.main import app
         self.client = TestClient(app)
+        self.pins = patch("app.db.firestore.sample_recent_routing_points", return_value=[])
+        self.pick = self.pins.start()
+        self.addCleanup(self.pins.stop)
+
+    SAMPLE = [(12.90 + 0.004 * k, 77.60 + 0.003 * k) for k in range(8)]
+
+    def test_random_real_stops_are_checked_too(self):
+        self.pick.return_value = self.SAMPLE
+        with OsrmEnv():
+            r = self.client.get("/health/osrm")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["sample"]["points"], 8)
+
+    def test_sample_with_no_routes_is_a_failure(self):
+        self.pick.return_value = self.SAMPLE
+        nulls = {(a, b) for a in self.SAMPLE for b in self.SAMPLE if a != b}
+        with OsrmEnv(FakeOsrm(null_pairs=nulls)) as env:
+            r = self.client.get("/health/osrm")
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("no route", r.json()["detail"])
+        self.assertIn("FAILED", env.chat.call_args.kwargs["json"]["text"])
+
+    def test_impossible_ratio_on_the_sample_is_a_failure(self):
+        self.pick.return_value = self.SAMPLE
+        with OsrmEnv(FakeOsrm(scale=0.1)):
+            r = self.client.get("/health/osrm")
+        self.assertEqual(r.status_code, 503)
+
+    def test_firestore_trouble_does_not_fail_the_check(self):
+        self.pick.side_effect = RuntimeError("firestore down")
+        with OsrmEnv():
+            r = self.client.get("/health/osrm")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("sample", r.json())
 
     def test_ok(self):
         with OsrmEnv() as env:

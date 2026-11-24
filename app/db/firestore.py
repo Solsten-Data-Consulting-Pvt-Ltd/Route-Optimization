@@ -57,6 +57,31 @@ def get_consignments_by_id(consignment_ids):
     return docs, not_found_ids
 
 
+def sample_recent_routing_points(n, pool):
+    """`n` random distinct (lat, lon) pins from up to `pool` active docs of
+    `consignments_routing` (single-field filter, so no extra index). Read-only; used by
+    the daily OSRM health check. Raises on a Firestore error (the caller
+    decides what that means)."""
+    import random
+
+    docs = (get_fs_client().collection(ROUTING_COLLECTION)
+            .where("is_active", "==", True).limit(pool).stream())
+    seen, points = set(), []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        if data.get("is_active") is False:
+            continue
+        try:
+            lat, lon = float(data["latitude"]), float(data["longitude"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        key = (round(lat, 5), round(lon, 5))
+        if key not in seen:
+            seen.add(key)
+            points.append((lat, lon))
+    return random.sample(points, min(n, len(points)))
+
+
 def _to_datetime(value):
     """Firestore Timestamp / datetime / ISO string -> aware datetime, else None."""
     from datetime import datetime, timezone

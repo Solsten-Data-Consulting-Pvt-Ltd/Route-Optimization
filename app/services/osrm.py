@@ -179,9 +179,41 @@ def shadow_stats(points, google_road):
     return stats
 
 
-def health_check():
+def check_sample(points):
+    """Sanity-check OSRM on real stops (`points`, [(lat, lon), ...]). Returns
+    {"points", "pairs", "null_share", "median_ratio"} or raises OsrmError with
+    what is wrong: too many pairs with no route, or a typical road distance
+    that is impossible next to the straight line (broken / partial map)."""
+    distances, snaps, _made = table(points)
+    pairs = nulls = 0
+    ratios = []
+    for i in range(len(points)):
+        for j in range(len(points)):
+            if i == j:
+                continue
+            pairs += 1
+            if distances[i][j] is None:
+                nulls += 1
+                continue
+            straight = straight_line_m(points[i], points[j])
+            if straight >= config.OSRM_HEALTH_RATIO_MIN_STRAIGHT_M:
+                ratios.append(distances[i][j] / straight)
+    null_share = nulls / pairs if pairs else 0.0
+    median = statistics.median(ratios) if ratios else None
+    lo, hi = config.OSRM_HEALTH_RATIO_RANGE
+    if null_share > config.OSRM_HEALTH_MAX_NULL_SHARE:
+        raise OsrmError(f"{nulls} of {pairs} pairs between {len(points)} real stops have no route")
+    if median is not None and not (lo <= median <= hi):
+        raise OsrmError(f"road/straight-line ratio on {len(points)} real stops is {median:.2f} "
+                        f"(normal is {lo}-{hi}); the map may be broken or partial")
+    return {"points": len(points), "pairs": pairs, "null_share": round(null_share, 3),
+            "median_ratio": round(median, 2) if median is not None else None}
+
+
+def health_check(sample_points=None):
     """Used by GET /health/osrm. {"status": "ok" | "disabled" | "failed", ...}.
-    Asks for one known route and one small table, and checks the answers."""
+    Asks for one known route and one small table, checks the answers, and when
+    `sample_points` (real stops picked at random) are given checks those too."""
     if not config.OSRM_BASE_URL:
         return {"status": "disabled", "detail": "OSRM_BASE_URL is not set"}
     started = time.monotonic()
@@ -200,8 +232,14 @@ def health_check():
                                           (12.9, 77.65)])
         if any(distances[i][j] is None for i in range(3) for j in range(3) if i != j):
             raise OsrmError("OSRM /table could not route between the test points")
+        sample = None
+        if sample_points and len(sample_points) >= 3:
+            sample = check_sample(sample_points)
     except OsrmError as e:
         return {"status": "failed", "detail": str(e),
                 "ms": int((time.monotonic() - started) * 1000)}
-    return {"status": "ok", "test_route_m": round(metres),
-            "ms": int((time.monotonic() - started) * 1000)}
+    result = {"status": "ok", "test_route_m": round(metres),
+              "ms": int((time.monotonic() - started) * 1000)}
+    if sample:
+        result["sample"] = sample
+    return result
