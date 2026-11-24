@@ -184,7 +184,15 @@ def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignm
     elif entry.get("source") in _MEMO_KNOWN_GOOD_SOURCES:
         classification = (codes.KNOWN_GOOD, codes.SOURCE_MEMO)
     else:  # api entry: resolution comes from the entry's source, no schema change
-        classification = (_pincode_resolution(result, codes.CONFIDENT), codes.SOURCE_MEMO)
+        doubt = entry.get("doubt") or {}
+        if doubt.get("resolution") == codes.MULTI_CANDIDATE:
+            # The first parcel of this place had several possible locations on
+            # Places; a parcel that reuses its pin must carry the same warning.
+            classification = (codes.MULTI_CANDIDATE, codes.SOURCE_MEMO)
+            if doubt.get("candidates"):
+                result["candidates"] = doubt["candidates"]
+        else:
+            classification = (_pincode_resolution(result, codes.CONFIDENT), codes.SOURCE_MEMO)
     logger.info("DRS memo hit (%s, source=%s) drs=%s for '%s'",
                 reason, entry.get("source"), drs_id, address[:80])
     cache_id = entry.get("cache_id")
@@ -342,9 +350,12 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
             except Exception:
                 logger.exception("Geocode cache write failed for '%s'", address[:80])
                 cache_id = None
+            doubt = ({"resolution": resolution,
+                      "candidates": _clean_candidates(geocode_result.get("candidates"))}
+                     if resolution == codes.MULTI_CANDIDATE else None)
             _safe(drs_memo.remember, drs_id, match_info, geocode_result, drs_memo.SOURCE_API,
                   lookup_address=lookup_address, consignment_id=consignment_id,
-                  cache_id=cache_id, entries=memo_entries)
+                  cache_id=cache_id, entries=memo_entries, doubt=doubt)
         elif consignment_id:
             try:
                 cache_id = _cache_id(save_to_cache(
