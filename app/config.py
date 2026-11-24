@@ -101,6 +101,33 @@ ROAD_CACHE_TTL_DAYS = 30
 ROUTING_RUNS_COLLECTION = "routing_runs"
 ROUTING_RUNS_TTL_DAYS = 90
 
+# Self-hosted OSRM road distances (featureFlags/roadDistanceProvider =
+# "google" | "shadow" | "osrm"; default google). Empty OSRM_BASE_URL = OSRM off.
+# The server is a private VM (no public IP), reached over the VPC, e.g.
+# http://10.160.0.2:5000 (osrm-backend, MLD, --max-table-size 150).
+OSRM_BASE_URL = os.environ.get("OSRM_BASE_URL", "").strip().rstrip("/")
+OSRM_TIMEOUT_S = float(os.environ.get("OSRM_TIMEOUT_S", "10"))
+# Sources / destinations per /table request (server limit is 150 each).
+OSRM_TABLE_BLOCK = 100
+# A stop whose pin snaps further than this from any road is not trusted: its
+# pairs use the straight-line estimate instead (gated layouts, missing lanes).
+OSRM_MAX_SNAP_M = 200
+# Shadow stats call a pair "off" when OSRM differs from Google by more than
+# this share AND more than this many metres.
+OSRM_OFF_RATIO = 0.25
+OSRM_OFF_MIN_M = 500
+# /health/osrm: a known short route in Bengaluru and the distance it should
+# be. 3,867 m on the 2026-11 map; a monthly map refresh may move it a little.
+OSRM_HEALTH_ROUTE = ((12.8864375, 77.6381875), (12.8949382, 77.6572065))
+OSRM_HEALTH_EXPECTED_M = 3867
+OSRM_HEALTH_TOLERANCE = 0.30
+
+# Alerts: a Google Chat space incoming webhook. Empty = alerts are only logged.
+ALERT_CHAT_WEBHOOK_URL = os.environ.get("ALERT_CHAT_WEBHOOK_URL", "").strip()
+ALERT_ENV_NAME = os.environ.get("ALERT_ENV_NAME", "").strip()
+# The same alert key is sent at most once per this many seconds per instance.
+ALERT_COOLDOWN_S = int(os.environ.get("ALERT_COOLDOWN_S", "1800"))
+
 GEOHASH_LOCALITY_LEN = 5
 GEOHASH_BUILDING_LEN = 6
 MAX_ROWS_PER_MERGE = 500

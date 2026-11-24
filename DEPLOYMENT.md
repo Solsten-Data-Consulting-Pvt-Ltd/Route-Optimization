@@ -434,6 +434,47 @@ Two things to remember:
 
 ---
 
+## 11. OSRM road distances: alerts and the 07:00 health check
+
+Details of the provider switch are in README.md ("Road distances from our own OSRM
+server"). One-time setup, per environment (dev first):
+
+1. **Google Chat webhook.** In the project's Chat space: Space settings -> Apps &
+   integrations -> Webhooks -> add one. Store the URL as a secret (never in git):
+
+   ```bash
+   printf '%s' 'https://chat.googleapis.com/v1/spaces/.../messages?key=...&token=...' | \
+     gcloud secrets create alert-chat-webhook-url --data-file=- --project <PROJECT_ID>
+   gcloud secrets add-iam-policy-binding alert-chat-webhook-url --project <PROJECT_ID> \
+     --member "serviceAccount:<CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT>" --role roles/secretmanager.secretAccessor
+   ```
+
+   Create the secret BEFORE merging, because the deploy mounts it.
+2. **Network.** `deploy-dev.yml` attaches the service to the `default` network/subnet
+   (Direct VPC egress, private ranges only) so it can reach the OSRM VM at its
+   private address. `OSRM_BASE_URL` comes from the GitHub variable `OSRM_DEV_BASE_URL`
+   (default `http://10.160.0.2:5000`). The default network's internal firewall rule
+   already allows port 5000 inside the VPC; if it was removed, allow tcp:5000 from
+   the VM's subnet.
+3. **07:00 IST health check** (01:30 UTC). The service is `--no-allow-unauthenticated`,
+   so the job calls it with an OIDC token:
+
+   ```bash
+   gcloud scheduler jobs create http osrm-health-0700 --project <PROJECT_ID> --location asia-south1 \
+     --schedule "0 7 * * *" --time-zone "Asia/Kolkata" --http-method GET \
+     --uri "https://<SERVICE_URL>/health/osrm?notify=true" \
+     --oidc-service-account-email <INVOKER_SERVICE_ACCOUNT> --oidc-token-audience "https://<SERVICE_URL>"
+   ```
+
+   The invoker service account needs `roles/run.invoker` on the service. Run it once
+   by hand (`gcloud scheduler jobs run osrm-health-0700 ...`): the Chat space should
+   get "OSRM health check OK".
+4. **Switching:** set `featureFlags/roadDistanceProvider` to `{ "value": "osrm" }`
+   (back to `"google"` is instant, no deploy). Watch `routing_runs`:
+   `provider`, `osrm_errors`, `snap_outliers`, `estimated_pairs`.
+
+---
+
 ## 10. Rules worth keeping
 
 - The branch decides the environment. Nothing deploys by hand.
