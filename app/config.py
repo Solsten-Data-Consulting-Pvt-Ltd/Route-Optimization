@@ -121,6 +121,15 @@ OSRM_OFF_MIN_M = 500
 OSRM_HEALTH_ROUTE = ((12.8864375, 77.6381875), (12.8949382, 77.6572065))
 OSRM_HEALTH_EXPECTED_M = 3867
 OSRM_HEALTH_TOLERANCE = 0.30
+# The daily check also asks OSRM about a few real stops picked at random from the
+# most recent `consignments_routing` docs (so it tests today's operating area,
+# not one fixed route). It fails when too many pairs have no route, or when the
+# typical road/straight-line ratio is impossible (a broken or partial map).
+OSRM_HEALTH_SAMPLE_POINTS = 10
+OSRM_HEALTH_SAMPLE_POOL = 300
+OSRM_HEALTH_MAX_NULL_SHARE = 0.20
+OSRM_HEALTH_RATIO_RANGE = (0.90, 3.5)
+OSRM_HEALTH_RATIO_MIN_STRAIGHT_M = 300
 
 # Alerts: a Google Chat space incoming webhook. Empty = alerts are only logged.
 ALERT_CHAT_WEBHOOK_URL = os.environ.get("ALERT_CHAT_WEBHOOK_URL", "").strip()

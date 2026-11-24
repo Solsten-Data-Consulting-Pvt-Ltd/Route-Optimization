@@ -29,7 +29,17 @@ def health_osrm(response: Response, notify: bool = False):
     503 = failed - and a failure also goes to the Google Chat space. With
     ?notify=true an OK result is posted to the space too, so a missing
     morning message means the check itself did not run."""
-    result = osrm.health_check()
+    sample = None
+    try:
+        from app import config
+        from app.db.firestore import sample_recent_routing_points
+
+        sample = sample_recent_routing_points(config.OSRM_HEALTH_SAMPLE_POINTS,
+                                              config.OSRM_HEALTH_SAMPLE_POOL)
+    except Exception:
+        # No sample (Firestore hiccup, empty collection): the fixed-route check still runs.
+        logging.getLogger(__name__).exception("OSRM health check: could not pick sample stops")
+    result = osrm.health_check(sample_points=sample)
     if result["status"] == "failed":
         response.status_code = 503
         alerts.send_alert("osrm_health_failed",
