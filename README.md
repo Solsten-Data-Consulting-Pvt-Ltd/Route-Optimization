@@ -191,6 +191,41 @@ The response adds `distance_source` (`road` / `straight_line`) and
 `road_distance` (`road_pairs`, `from_cache`, `from_api`, `api_elements`,
 `api_errors`, `rate_limited`, `estimated_pairs`, `mode`, `detour_factor`).
 
+#### Road distances from our own OSRM server (`featureFlags/roadDistanceProvider`)
+
+Where the road-distance table comes from, once `roadDistanceRouting` is on. One
+Firestore doc `featureFlags/roadDistanceProvider` with `{ "value": "google" | "shadow" | "osrm" }`
+(missing / anything else = `google`; read every ~45 s, no redeploy):
+
+- `google` - as above.
+- `shadow` - the route is built from Google as above; OSRM is asked for the same
+  points and only the comparison is logged on the `routing_runs` doc
+  (`shadow_median_ratio`, `shadow_p90_ratio`, `shadow_off_pairs`, `shadow_off_pct`,
+  `snap_outliers`). OSRM problems are ignored (`shadow_error`).
+- `osrm` - every pair from OSRM (`app/services/osrm.py`), **no Google call**. The
+  road cache is not used and OSRM answers are not written to it. A pair OSRM
+  cannot route, or whose stop snaps more than `OSRM_MAX_SNAP_M` (200 m) from any
+  road, uses the straight-line estimate. If OSRM cannot be reached at all, that DRS
+  is planned on straight lines (as for any road-matrix failure) and an alert goes to
+  the project's Google Chat space (`osrm_matrix_failed`, at most one per 30 min
+  per instance).
+
+Config (env): `OSRM_BASE_URL` (empty = OSRM off, e.g. `http://10.160.0.2:5000`),
+`OSRM_TIMEOUT_S` (10), `ALERT_CHAT_WEBHOOK_URL` (secret, a Chat space incoming
+webhook; empty = alerts are only logged), `ALERT_ENV_NAME` (`dev` / `prod`, prefix
+of every alert). The server is a private VM reached over the VPC (Cloud Run Direct
+VPC egress, see `deploy-dev.yml`). Big DRSs are asked in 100 x 100 blocks.
+
+**Daily health check:** `GET /health/osrm` asks OSRM for a known Bengaluru route
+(about 3,867 m) and a small table. 200 = ok (or `disabled` when `OSRM_BASE_URL` is
+empty); 503 = failed, and a failure always posts to the Chat space. `?notify=true`
+also posts an OK, so a missing morning message means the check did not run.
+Schedule it with Cloud Scheduler at 07:00 IST (`DEPLOYMENT.md` section 11).
+
+Measured on 3 real DRSs against Google (offline_eval/phase2-results.md): distances
+match within about 1% at the median; the route order is 1-10% longer by road on big
+DRSs because OpenStreetMap lacks some one-way / closed-lane detail.
+
 **Setup before turning it on:** enable *Routes API* on the Google Cloud project
 of `GOOGLE_MAPS_API_KEY` (and allow it on the key if the key has API
 restrictions), set a billing budget alert and a daily quota cap on Compute

@@ -217,13 +217,15 @@ def detour_factor(points, road_values):
     return min(ROAD_DETOUR_FACTOR_MAX, max(ROAD_DETOUR_FACTOR_MIN, statistics.median(ratios)))
 
 
-def build_distance_matrix(points, max_elements=ROAD_MAX_ELEMENTS_PER_RUN):
+def build_distance_matrix(points, max_elements=ROAD_MAX_ELEMENTS_PER_RUN, road_out=None):
     """Square matrix (metres, int) over `points` [(lat, lon), ...].
 
     Every pair (small DRS) or each point's nearest pairs (large DRS) use road
     distance (cache first, then the API). Anything left - and any pair the
     cache/API couldn't answer - is estimated from this DRS's own road/straight
-    ratio. Returns (matrix, stats).
+    ratio. Returns (matrix, stats). `road_out`, if given (a dict), is filled
+    with {(i, j): metres} for every pair answered by road (used by the OSRM
+    shadow comparison).
     """
     n = len(points)
     cells = [_cell(p) for p in points]
@@ -330,4 +332,6 @@ def build_distance_matrix(points, max_elements=ROAD_MAX_ELEMENTS_PER_RUN):
 
     stats["road_pairs"] = len(road)
     stats["estimated_pairs"] = n * (n - 1) - stats["road_pairs"]
+    if road_out is not None:
+        road_out.update(road)
     return matrix, stats
