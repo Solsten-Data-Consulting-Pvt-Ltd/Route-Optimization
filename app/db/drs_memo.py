@@ -103,12 +103,18 @@ def remember(drs_id, info: dict, result: dict, source: str, *,
              consignment_id: Optional[str] = None,
              cache_id: Optional[str] = None,
              entries: Optional[dict] = None,
+             doubt: Optional[dict] = None,
              _target_entry_id: Optional[str] = None) -> Optional[str]:
     """Store `result` as this consignment's memo entry. Returns the entry id.
 
     `entries` (already-loaded memo) avoids a second read; if omitted it is
     loaded. An entry is never downgraded (e.g. an API pin never replaces an
     executive correction) - in that case only variants/ids are appended.
+
+    `doubt` ({"resolution": "MULTI_CANDIDATE", "candidates": [...]}) records that
+    Places found several possible locations for this place. A later parcel that
+    reuses this API pin inherits the same warning (see save._memo_hit); an
+    executive-confirmed pin writes no doubt, which clears it.
 
     `_target_entry_id` (internal, set by `reconcile`) writes into an
     already-matched entry instead of this address's own hash - used to
@@ -133,6 +139,7 @@ def remember(drs_id, info: dict, result: dict, source: str, *,
     entry["partial_match"] = bool(entry.get("partial_match"))
     entry["match"] = {field: info.get(field) for field in MATCH_FIELDS}
     entry["source"] = source
+    entry["doubt"] = doubt or None
     entry["updated_at"] = firestore.SERVER_TIMESTAMP
     if cache_id:
         entry["cache_id"] = cache_id

@@ -27,6 +27,7 @@ from google.cloud.firestore_v1.transforms import ArrayUnion
 
 from app.db import drs_memo
 from app.schemas import ConfirmedLocation
+from app.services import geocode_codes as codes
 from app.services import save as save_mod
 from app.services.address_match import (
     consignment_match_info,
@@ -298,6 +299,44 @@ class GeocodeOrderTests(unittest.TestCase):
         self.assertEqual((r2["latitude"], r2["longitude"]), (r1["latitude"], r1["longitude"]))
         entry = next(iter(self.store.docs["DRS-KODATHI"]["entries"].values()))
         self.assertEqual(entry["consignment_ids"], ["C1", "C2"])
+
+    # --- a reused pin keeps the "Several matches" warning of the first parcel -----
+    CANDIDATES = [
+        {"latitude": 12.88, "longitude": 77.73, "in_pincode": True, "name": "Phase 1",
+         "formatted_address": "Kodathi A", "pincode": "560035", "place_id": "p1"},
+        {"latitude": 12.89, "longitude": 77.74, "in_pincode": True, "name": "Phase 2",
+         "formatted_address": "Kodathi B", "pincode": "560035", "place_id": "p2"},
+    ]
+
+    def _geocode_v2(self, recv, cid, resolution):
+        result = dict(PLACES[LIKHITHA_OCR], candidates=[dict(c) for c in self.CANDIDATES])
+        classified = (result, None, None, resolution, codes.SOURCE_PLACES)
+        with patch.object(save_mod, "get_cached_geocode_with_outcome", return_value=(None, "miss")), \
+             patch.object(save_mod, "places_search_classified", return_value=classified) as places:
+            out = save_mod._geocode(
+                f"{recv['name']}, {recv['address']}", lookup_address=recv["address"],
+                drs_id="DRS-KODATHI", match_info=info(recv), consignment_id=cid, use_v2=True)
+        return out, places.call_count
+
+    def test_reused_pin_keeps_several_matches_warning(self):
+        (_, *_r1), calls1 = self._geocode_v2(LIKHITHA_1, "C1", codes.MULTI_CANDIDATE)
+        (r2, _, _, outcome, cls), calls2 = self._geocode_v2(LIKHITHA_2, "C2", codes.MULTI_CANDIDATE)
+        self.assertEqual((calls1, calls2, outcome), (1, 0, "drs_hit"))
+        self.assertEqual(cls, (codes.MULTI_CANDIDATE, codes.SOURCE_MEMO))
+        self.assertEqual([c["place_id"] for c in r2["candidates"]], ["p1", "p2"])
+
+    def test_reused_pin_without_doubt_stays_confident(self):
+        self._geocode_v2(LIKHITHA_1, "C1", codes.CONFIDENT)
+        (r2, _, _, outcome, cls), _ = self._geocode_v2(LIKHITHA_2, "C2", codes.CONFIDENT)
+        self.assertEqual((outcome, cls), ("drs_hit", (codes.CONFIDENT, codes.SOURCE_MEMO)))
+        self.assertNotIn("candidates", r2)
+
+    def test_executive_confirmed_pin_clears_the_inherited_warning(self):
+        self._geocode_v2(LIKHITHA_1, "C1", codes.MULTI_CANDIDATE)
+        drs_memo.remember("DRS-KODATHI", info(LIKHITHA_1), {"latitude": 9.0, "longitude": 9.0},
+                          drs_memo.SOURCE_EXEC_CORRECTED, consignment_id="C1")
+        (r2, _, _, outcome, cls), _ = self._geocode_v2(LIKHITHA_2, "C2", codes.MULTI_CANDIDATE)
+        self.assertEqual((outcome, r2["latitude"], cls[0]), ("drs_hit", 9.0, codes.KNOWN_GOOD))
 
     def test_verified_cache_beats_memo_api_pin(self):
         self._geocode(LIKHITHA_1, "C1")
