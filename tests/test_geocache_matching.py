@@ -14,6 +14,7 @@ from rapidfuzz import fuzz, utils
 
 from app.services.address import build_geocode_address, normalize_to_single_line
 from app.db.geocache import _is_safe_fuzzy_match, _result_from_cache
+from app.services.address_match import building_name_conflict
 
 # --- Mirrors app/db/geocache.py ---
 GEOCODE_CACHE_FUZZY_THRESHOLD = 85
@@ -215,6 +216,30 @@ class TestSafeCacheReuse(unittest.TestCase):
         self.assertFalse(_is_safe_fuzzy_match(
             "MG Road Bengaluru", "MG Road Bengaluru Karnataka",
         ))
+
+    def test_different_buildings_on_the_same_road_cannot_be_a_fuzzy_hit(self):
+        # Prod 2026-11-25: Purva Skydale scored 86 against RBD Still Water
+        # (threshold 85) and inherited its pin, 548 m away.
+        rbd = "rbd still water apartments silver country road haralur road bengaluru karnataka india"
+        skydale = "tower purva skydale apartments harlur silver county road bengaluru karnataka india"
+        self.assertGreaterEqual(fuzzy_score(skydale, rbd), GEOCODE_CACHE_FUZZY_THRESHOLD)
+        self.assertFalse(_is_safe_fuzzy_match(skydale, rbd))
+        self.assertFalse(_is_safe_fuzzy_match(rbd, skydale))
+
+    def test_spelling_variants_of_one_building_still_fuzzy_match(self):
+        a = "purva skydale apartments harlur silver county road bengaluru karnataka india"
+        b = "purva skydale apartments haralur silver country road bengaluru karnataka india"
+        self.assertTrue(_is_safe_fuzzy_match(a, b))
+
+    def test_extra_landmark_on_one_side_still_fuzzy_matches(self):
+        a = "purva skydale apartments silver county road haralur bengaluru karnataka india"
+        b = "tower 3 purva skydale silver county road haralur opposite bengaluru karnataka india"
+        self.assertTrue(_is_safe_fuzzy_match(a, b))
+
+    def test_building_type_words_alone_are_not_a_name_conflict(self):
+        a = "purva skydale apartments silver county road haralur bengaluru india"
+        b = "purva skydale tower silver county road haralur bengaluru india"
+        self.assertFalse(building_name_conflict(a, b))
 
     def test_exact_building_label_ignores_a_pincode_disagreement(self):
         result = _result_from_cache(
