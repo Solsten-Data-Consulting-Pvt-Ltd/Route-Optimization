@@ -34,7 +34,9 @@ from app.db.geocache import (
     save_to_cache,
     verify_cache_group,
 )
-from app.services.address_match import consignment_match_info
+from app.services.address_match import (
+    building_name_conflict, consignment_match_info, loose_key, match_key,
+)
 
 
 PINCODE_RE = re.compile(r"\b\d{6}\b")
@@ -135,6 +137,30 @@ def _drs_id(routing, consignment):
     ).strip()
 
 
+def _names_other_building(entry, address):
+    """True when a cache entry's own identity names a different building.
+
+    A fuzzy hit used to link a consignment to an entry for another building on
+    the same road (Purva Skydale -> RBD Still Water) and write its spelling
+    onto that entry. Corrections and delivery evidence must not follow that
+    link, or they overwrite the real owner's pin.
+    """
+    own = entry.get("address_normalized") or ""
+    if not own or not address:
+        return False
+    return building_name_conflict(
+        loose_key(match_key(normalize_address(address))), loose_key(match_key(own)),
+    )
+
+
+def _detach_foreign_owner(cache_id, address):
+    """Forget the stray spelling a wrong fuzzy hit recorded on `cache_id`."""
+    get_fs_client().collection("geocode_cache").document(cache_id).update({
+        "address_normalized_variants": firestore.ArrayRemove([normalize_address(address)]),
+    })
+    invalidate_snapshot()
+
+
 def _resolve_owner(consignment_id):
     """(cache_id, entry, routing, consignment) or no owner.
 
@@ -143,16 +169,21 @@ def _resolve_owner(consignment_id):
     """
     routing = _routing(consignment_id)
     consignment = _consignment(consignment_id)
+    receiver = consignment.get("receiver") or {}
+    address = receiver.get("address") or routing.get("receiverAddress") or ""
+
     cache_id = routing.get("geocode_cache_id")
     if cache_id:
         hit = get_cache_entry(cache_id)
-        if hit:
+        if hit and _names_other_building(hit[1], address):
+            _detach_foreign_owner(hit[0], address)
+        elif hit:
             return *hit, routing, consignment
 
-    receiver = consignment.get("receiver") or {}
-    address = receiver.get("address") or routing.get("receiverAddress") or ""
     hit = find_cache_entry(normalize_address(address))
-    if hit:
+    if hit and _names_other_building(hit[1], address):
+        _detach_foreign_owner(hit[0], address)
+    elif hit:
         return *hit, routing, consignment
 
     drs_id = _drs_id(routing, consignment)
@@ -162,12 +193,12 @@ def _resolve_owner(consignment_id):
         memo_hit = drs_memo.find_match(entries, info) if info else None
         if memo_hit and memo_hit[1].get("cache_id"):
             hit = get_cache_entry(memo_hit[1]["cache_id"])
-            if hit:
+            if hit and not _names_other_building(hit[1], address):
                 return *hit, routing, consignment
         for entry in entries.values():
             if consignment_id in (entry.get("consignment_ids") or []) and entry.get("cache_id"):
                 hit = get_cache_entry(entry["cache_id"])
-                if hit:
+                if hit and not _names_other_building(hit[1], address):
                     return *hit, routing, consignment
     return None, None, routing, consignment
 

@@ -80,7 +80,9 @@ from app.config import (
     GEOCODE_CACHE_UNVERIFIED_TTL_DAYS,
 )
 from app.db.clients import get_fs_client
-from app.services.address_match import door_numbers, is_precise, loose_key, match_key
+from app.services.address_match import (
+    building_name_conflict, door_numbers, is_precise, loose_key, match_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -323,7 +325,7 @@ def _exact_lookup(normalized: str):
     return docs[0].id, (docs[0].to_dict() or {})
 
 def _is_safe_fuzzy_match(incoming: str, cached: str) -> bool:
-    """A fuzzy text score cannot overrule a different building number.
+    """A fuzzy text score cannot overrule a different building number or name.
 
     Vague road-only strings are equally unsafe: a high token score there means
     only that two labels name the same road, not the same delivery point.
@@ -334,11 +336,15 @@ def _is_safe_fuzzy_match(incoming: str, cached: str) -> bool:
         return False
     incoming_doors = door_numbers(incoming_key)
     cached_doors = door_numbers(cached_key)
-    return not (
+    if (
         incoming_doors
         and cached_doors
         and not (incoming_doors <= cached_doors or cached_doors <= incoming_doors)
-    )
+    ):
+        return False
+    # Same road and city is not the same building: both labels naming
+    # different buildings (RBD Still Water vs Purva Skydale) is no match.
+    return not building_name_conflict(incoming_key, cached_key)
 
 
 def _fuzzy_lookup(normalized: str):
