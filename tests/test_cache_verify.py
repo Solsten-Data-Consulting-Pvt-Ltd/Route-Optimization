@@ -168,3 +168,77 @@ class CacheVerificationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForeignOwnerTests(unittest.TestCase):
+    """A fuzzy hit once linked Purva Skydale to the RBD Still Water entry
+    (prod 2026-11-25); a correction then overwrote RBD's pin."""
+
+    RBD = "rbd still water apartments silver country road haralur road bengaluru karnataka india"
+    SKYDALE_ADDR = "Tower, Purva Skydale Apartments, Harlur, Silver County Road, Bangalore, Karnataka 560068, India"
+
+    def setUp(self):
+        self.skydale = cache_verify.normalize_address(self.SKYDALE_ADDR)
+        self.docs = {"geocode_cache": {"rbd": {
+            "address_normalized": self.RBD,
+            "address_normalized_variants": [self.RBD, self.skydale],
+            "latitude": 12.8980267, "longitude": 77.6653239, "verified": True,
+        }}}
+        self.client = _Client(self.docs)
+        self.consignment = {"receiver": {"address": self.SKYDALE_ADDR}}
+        self.routing = {"drsId": "DRS-2", "geocode_cache_id": "rbd"}
+        for target, value in (
+            ("get_fs_client", self.client),
+        ):
+            p = patch.object(cache_verify, target, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        for name, value in (
+            ("_routing", self.routing), ("_consignment", self.consignment),
+        ):
+            p = patch.object(cache_verify, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.object(cache_verify, "get_cache_entry",
+                         side_effect=lambda cid: (cid, dict(self.docs["geocode_cache"][cid]))
+                         if cid in self.docs["geocode_cache"] else None)
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(cache_verify, "find_cache_entry",
+                         side_effect=lambda n: next(
+                             ((cid, dict(d)) for cid, d in self.docs["geocode_cache"].items()
+                              if n in (d.get("address_normalized_variants") or [])), None))
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(cache_verify, "invalidate_snapshot")
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(cache_verify.drs_memo, "load_entries", return_value={})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_other_building_entry_is_not_the_owner_and_loses_the_stray_spelling(self):
+        # ArrayRemove is not modelled by the fake _Ref, so check the call instead.
+        removed = []
+        real_update = _Ref.update
+
+        def update(ref, fields):
+            from google.cloud.firestore_v1.transforms import ArrayRemove
+            value = fields.get("address_normalized_variants")
+            if isinstance(value, ArrayRemove):
+                removed.extend(value.values)
+                return
+            real_update(ref, fields)
+
+        with patch.object(_Ref, "update", update):
+            owner = cache_verify._resolve_owner("HRD62119876")
+        self.assertIsNone(owner[0])
+        self.assertEqual(set(removed), {self.skydale})
+        self.assertEqual(self.docs["geocode_cache"]["rbd"]["latitude"], 12.8980267)
+
+    def test_same_building_spelling_variant_is_still_the_owner(self):
+        self.consignment["receiver"]["address"] = (
+            "RBD Still Water Apartments, Silver County Road, Haralur Road, Bengaluru, Karnataka 560102"
+        )
+        owner = cache_verify._resolve_owner("RKT10770703")
+        self.assertEqual(owner[0], "rbd")

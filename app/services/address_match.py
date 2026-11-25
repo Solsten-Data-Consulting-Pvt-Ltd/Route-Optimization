@@ -98,6 +98,14 @@ GENERIC_WORDS = {
 }
 
 
+# Words that say what KIND of building it is, not WHICH one.
+BUILDING_TYPE_WORDS = {
+    "apartment", "apartments", "apt", "apts", "flat", "flats", "tower",
+    "towers", "building", "bldg", "complex", "society", "wing",
+}
+NAME_WORD_SIMILARITY = 80
+
+
 def match_key(address: str) -> str:
     """Comparison key: lowercase, no punctuation, no phone/pincode, spellings
     standardised, repeated words dropped. Keeps '140/1' intact."""
@@ -151,6 +159,33 @@ def is_precise(key: str, locality_words: Iterable[str] = ()) -> bool:
         return True
     distinctive = set(key.split()) - GENERIC_WORDS - set(locality_words or ())
     return len(distinctive) >= 3
+
+
+def _name_words(key: str) -> set:
+    return {
+        t for t in key.split()
+        if t.isalpha() and len(t) >= 3
+        and t not in GENERIC_WORDS and t not in BUILDING_TYPE_WORDS
+    }
+
+
+def _has_similar_word(word: str, words: set) -> bool:
+    return any(fuzz.ratio(word, other) >= NAME_WORD_SIMILARITY for other in words)
+
+
+def building_name_conflict(key_a: str, key_b: str) -> bool:
+    """True when BOTH labels carry building/area name words the other lacks.
+
+    Two labels that share a road and city ("... Apartments, Silver County Road,
+    Bengaluru") can score high on text similarity while naming different
+    buildings ("RBD Still Water" vs "Purva Skydale"). A spelling variant
+    ("Harlur"/"Haralur") still counts as the same word, and extra words on one
+    side only (a landmark, a floor) are not a conflict.
+    """
+    a, b = _name_words(key_a), _name_words(key_b)
+    only_a = [w for w in a if not _has_similar_word(w, b)]
+    only_b = [w for w in b if not _has_similar_word(w, a)]
+    return bool(only_a and only_b)
 
 
 def clean_phone(value) -> Optional[str]:
