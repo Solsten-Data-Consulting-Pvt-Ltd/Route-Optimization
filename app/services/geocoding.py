@@ -406,6 +406,27 @@ def is_area_level(place):
     return bool(types) and types <= AREA_LEVEL_TYPES
 
 
+# Place types that mean "the centre of a pincode, city or state": Google found
+# no street, area or building, so the pin is a point in the middle of a region
+# and says nothing about where the parcel goes. (Roads and neighbourhoods are
+# NOT in this set; they are coarse but a real label can name only a road.)
+COARSE_TYPES = {
+    "postal_code", "locality", "administrative_area_level_1",
+    "administrative_area_level_2", "administrative_area_level_3",
+    "country", "political",
+}
+COARSE_ADDRESS_REASON = (
+    "Address has only a pincode or city, no street or area. "
+    "Add the street or area, or drop the pin at the delivery point."
+)
+
+
+def is_coarse_level(place):
+    """True when every type of the result is a pincode / city / state / country."""
+    types = set(place.get("types") or [])
+    return bool(types) and types <= COARSE_TYPES
+
+
 def _name_key(text):
     words = re.findall(r"[a-z0-9]+", str(text or "").lower())
     return " ".join(w for w in words if w not in _GENERIC_NAME_WORDS)
@@ -471,6 +492,14 @@ def _building_retry(result, building_query, address_pincode, max_retries):
     return new
 
 
+def _coarse_failure(address):
+    """Pincode/city-only answer: treated like "address not found" so no pin is
+    saved, the stop reads "No match" and blocks SOD until a pin is placed."""
+    logger.info("Coarse (pincode/city-level) result for '%s'; treating as not found",
+                address[:60])
+    return None, COARSE_ADDRESS_REASON, ERR_ADDRESS_NOT_FOUND, ZERO_RESULTS, None
+
+
 def places_search_classified(address: str, use_v2: bool = False,
                              retry_address=None, max_retries: int = 3,
                              building_query=None, match_names=None):
@@ -518,6 +547,8 @@ def places_search_classified(address: str, use_v2: bool = False,
                 better = None
             if better is not None:
                 return better, None, None, CONFIDENT, SOURCE_PLACES_RETRY
+        if use_v2 and is_coarse_level(result):
+            return _coarse_failure(address)
         return result, None, None, resolution, SOURCE_PLACES
 
     if use_v2 and error_code == ERR_ADDRESS_NOT_FOUND and retry_address:
@@ -527,6 +558,8 @@ def places_search_classified(address: str, use_v2: bool = False,
             retry_address, pincode or extract_pincode(retry_address), use_v2, max_retries,
         )
         if r_result is not None:
+            if use_v2 and is_coarse_level(r_result):
+                return _coarse_failure(address)
             return r_result, None, None, r_resolution, SOURCE_PLACES_RETRY
 
     return None, error_reason, error_code, resolution, None

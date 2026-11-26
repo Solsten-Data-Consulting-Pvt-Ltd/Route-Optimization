@@ -136,6 +136,75 @@ class PlacesSearchClassifiedTests(unittest.TestCase):
         self.assertEqual(places_search_classified("  ")[3], "MISSING_ADDRESS")
 
 
+class CoarseResultTests(unittest.TestCase):
+    """A pincode / city / state centre is no location: it becomes "not found"."""
+
+    PIN_ONLY = "Karnataka 560035, India"
+
+    @staticmethod
+    def typed(types, pid="a", pincode="560035"):
+        p = place(pid, *BASE, pincode)
+        p["types"] = types
+        return p
+
+    def test_is_coarse_level(self):
+        from app.services.geocoding import is_coarse_level
+        self.assertTrue(is_coarse_level({"types": ["postal_code"]}))
+        self.assertTrue(is_coarse_level({"types": ["locality", "political"]}))
+        self.assertTrue(is_coarse_level({"types": ["administrative_area_level_1", "political"]}))
+        # roads, neighbourhoods and real places are not coarse
+        self.assertFalse(is_coarse_level({"types": ["route"]}))
+        self.assertFalse(is_coarse_level({"types": ["neighborhood", "political"]}))
+        self.assertFalse(is_coarse_level({"types": ["sublocality", "sublocality_level_1", "political"]}))
+        self.assertFalse(is_coarse_level({"types": ["establishment", "point_of_interest"]}))
+        self.assertFalse(is_coarse_level({"types": ["postal_code", "street_address"]}))
+        self.assertFalse(is_coarse_level({"types": []}))
+
+    def test_pincode_only_result_is_not_found_when_flag_on(self):
+        with patch.object(geocoding.requests, "post",
+                          return_value=_resp([self.typed(["postal_code"])])):
+            out = places_search_classified(self.PIN_ONLY, use_v2=True)
+        self.assertEqual((out[0], out[2], out[3], out[4]),
+                         (None, "ADDRESS_NOT_FOUND", "ZERO_RESULTS", None))
+        self.assertIn("pincode", out[1])
+
+    def test_city_centre_result_is_not_found_when_flag_on(self):
+        with patch.object(geocoding.requests, "post",
+                          return_value=_resp([self.typed(["locality", "political"])])):
+            out = places_search_classified("Bengaluru, Karnataka 560035", use_v2=True)
+        self.assertEqual((out[0], out[3]), (None, "ZERO_RESULTS"))
+
+    def test_flag_off_keeps_todays_pin(self):
+        with patch.object(geocoding.requests, "post",
+                          return_value=_resp([self.typed(["postal_code"])])):
+            out = places_search_classified(self.PIN_ONLY, use_v2=False)
+        self.assertEqual(out[0]["place_id"], "a")
+        self.assertEqual(out[3], "CONFIDENT")
+
+    def test_road_or_neighbourhood_result_still_gets_a_pin(self):
+        for types in (["route"], ["neighborhood", "political"]):
+            with patch.object(geocoding.requests, "post",
+                              return_value=_resp([self.typed(types)])):
+                out = places_search_classified("16th Cross Rd, KPC Layout, Bengaluru 560035",
+                                               use_v2=True)
+            self.assertIsNotNone(out[0], types)
+            self.assertEqual(out[3], "CONFIDENT")
+
+    def test_real_place_result_is_unaffected(self):
+        with patch.object(geocoding.requests, "post",
+                          return_value=_resp([self.typed(["establishment", "point_of_interest"])])):
+            out = places_search_classified("Asha, 12 Kodathi Main Road, Bengaluru 560035",
+                                           use_v2=True)
+        self.assertEqual((out[0]["place_id"], out[3]), ("a", "CONFIDENT"))
+
+    def test_coarse_answer_after_zero_results_retry_is_not_found(self):
+        with patch.object(geocoding.requests, "post",
+                          side_effect=[_resp([]), _resp([self.typed(["postal_code"])])]):
+            out = places_search_classified("Zzz, 560035", use_v2=True,
+                                           retry_address="Karnataka 560035, India")
+        self.assertEqual((out[0], out[3]), (None, "ZERO_RESULTS"))
+
+
 class _Coll:
     def __init__(self, docs=None, error=None):
         self.docs, self.error, self.calls = docs or {}, error, 0
