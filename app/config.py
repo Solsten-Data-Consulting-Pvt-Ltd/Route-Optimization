@@ -30,6 +30,9 @@ GEOCODE_CACHE_MIN_VISITS = 1
 # this far or more from the saved pin. Kept tight on purpose, separate from
 # the verify radius above.
 GEOCODE_CACHE_SUGGEST_RADIUS_METERS = 150
+# Building-name cache match (flag cacheNameMatch): matching verified pins more than
+# this far apart means the name is not unique, so none is used.
+GEOCODE_CACHE_NAME_MATCH_SPREAD_METERS = 300
 GEOCODE_CACHE_MAX_OBSERVATIONS = 20
 GEOCODE_CACHE_MAX_OBSERVATION_ACCURACY_METERS = 100
 
