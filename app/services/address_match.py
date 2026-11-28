@@ -173,6 +173,19 @@ def _has_similar_word(word: str, words: set) -> bool:
     return any(fuzz.ratio(word, other) >= NAME_WORD_SIMILARITY for other in words)
 
 
+def name_match_words(name: str) -> list:
+    """Distinctive words of a building name for the cache name match: letters
+    only, 3+ letters, no tower/wing/block/flat labels, road or city words.
+    east/west/north/south stay (Owners Court East is not Owners Court West)."""
+    return sorted(_name_words(match_key(name)))
+
+
+def name_words_in_text(words, text: str) -> bool:
+    """True when EVERY word appears (spelling tolerant) in `text`'s name words."""
+    text_words = _name_words(match_key(text))
+    return bool(words) and all(_has_similar_word(w, text_words) for w in words)
+
+
 def building_name_conflict(key_a: str, key_b: str) -> bool:
     """True when BOTH labels carry building/area name words the other lacks.
 

@@ -84,6 +84,7 @@ Behind **`featureFlags/geocodeResolutionV2`** (default off):
 - Places is asked for up to 5 candidates. Candidates in the address's pincode are preferred, and in-pincode candidates more than 300 m apart give `MULTI_CANDIDATE`.
 - One retry with a shortened address (`address.build_retry_address`) runs before `ZERO_RESULTS`.
 - A result that is only a pincode, city or state centre (Google types all within `COARSE_TYPES`, e.g. `postal_code`) is treated as `ZERO_RESULTS`: no pin is saved, the stop reads "No match" in 3PL and blocks SOD until a pin is placed. Roads and neighbourhoods still get a pin. Only with `geocodeResolutionV2` on.
+- Building-name cache match (flag `cacheNameMatch`, off by default): after the exact and fuzzy cache lookups miss, a label whose building name (2+ distinctive words, from `address_match_names`) is fully contained in a verified entry's text uses that entry's pin. Tower/wing/block/flat and the landmark carry no weight; east/west stay name words; a pincode on both sides must agree; matching entries more than 300 m apart (a name like "Shubh Enclave") mean no match. Reports as `cache_fuzzy`, no variant is recorded. `geocache._name_lookup`.
 - `MULTI_CANDIDATE` and `PINCODE_MISMATCH` rows become `needs_review`. They are **still routed**.
 - `geocode_error` uses one standard message per resolution.
 - An accepted preview pin carries its `resolution`, `source`, `pincode` and (`7b648de`) `candidates` into the save. The candidates are written to Firestore `consignments_routing.geocode_candidates` for admin review.

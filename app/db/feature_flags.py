@@ -16,6 +16,7 @@ from app.db.clients import get_fs_client
 logger = logging.getLogger(__name__)
 
 FLAG_GEOCODE_RESOLUTION_V2 = "geocodeResolutionV2"
+FLAG_CACHE_NAME_MATCH = "cacheNameMatch"
 FLAG_ROAD_DISTANCE_ROUTING = "roadDistanceRouting"
 # Where road distances come from once roadDistanceRouting is on: a document
 # {"value": "google" | "shadow" | "osrm"}. Anything else / missing = google.
@@ -56,6 +57,11 @@ def is_enabled(flag_id: str) -> bool:
 
 def geocode_resolution_v2() -> bool:
     return is_enabled(FLAG_GEOCODE_RESOLUTION_V2)
+
+
+def cache_name_match() -> bool:
+    """Building-name match against verified cache entries (see geocache._name_lookup)."""
+    return is_enabled(FLAG_CACHE_NAME_MATCH)
 
 
 def road_distance_routing() -> bool:
