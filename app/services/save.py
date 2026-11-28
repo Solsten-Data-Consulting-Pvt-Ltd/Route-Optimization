@@ -128,6 +128,20 @@ def _use_v2():
         return False
 
 
+def _use_name_match():
+    """cacheNameMatch, read once per request. Any error counts as off."""
+    try:
+        return feature_flags.cache_name_match()
+    except Exception:
+        logger.exception("Feature flag lookup failed; cacheNameMatch off")
+        return False
+
+
+def _landmark_of(components):
+    comps = components if isinstance(components, dict) else {}
+    return str(comps.get("landmark") or "").strip() or None
+
+
 def _components_of(receiver):
     """OCR address components on the consignment (3PL stores them as
     receiver.addressComponent; addressComponents accepted too)."""
@@ -221,12 +235,13 @@ def _memo_hit(drs_id, entry_id, entry, reason, address, lookup_address, consignm
 
 def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
              consignment_id=None, use_v2=False, retry_address=None, building_query=None,
-             match_names=None):
+             match_names=None, landmark=None, name_match=False):
     """Resolve a pin. Order:
 
       1. DRS memo, executive-corrected entries only (a correction made in this
          DRS today is the newest human decision)
-      2. verified geocode_cache (addresses verified at end of earlier DRSs)
+      2. verified geocode_cache (addresses verified at end of earlier DRSs); with
+         `name_match` (flag cacheNameMatch) also a building-name match
       3. DRS memo, any entry (same receiver/place geocoded earlier in this DRS)
       4. Places API
 
@@ -272,6 +287,7 @@ def _geocode(address, lookup_address=None, drs_id=None, match_info=None,
         cached, cache_outcome, cache_id = _unpack_cache_lookup(
             get_cached_geocode_with_outcome(
                 address, lookup_address=lookup_address, include_cache_id=True,
+                match_names=match_names, landmark=landmark, name_match=name_match,
             )
         )
     except Exception:
@@ -442,6 +458,8 @@ def preview_geocode(receiver_name, receiver_address, drs_id=None, consignment_id
             use_v2=use_v2, retry_address=retry_address,
             building_query=build_building_query(address_components or doc_components),
             match_names=address_match_names(address_components or doc_components, receiver_address),
+            landmark=_landmark_of(address_components or doc_components),
+            name_match=_use_name_match(),
         )
     )
 
@@ -582,6 +600,7 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
     )
 
     use_v2 = _use_v2()
+    use_name_match = _use_name_match()
     deduped_ids = _dedupe(consignment_ids)
     docs, not_found_ids = get_consignments_by_id(deduped_ids)
 
@@ -721,6 +740,8 @@ def save_consignments_pipeline(consignment_ids, confirmed_locations=None):
                     ),
                     building_query=build_building_query(_components_of(receiver)),
                     match_names=address_match_names(_components_of(receiver), receiver_address),
+                    landmark=_landmark_of(_components_of(receiver)),
+                    name_match=use_name_match,
                 ))
             if geocode_result is None and not resolution:
                 resolution = codes.resolution_for_error(error_code)

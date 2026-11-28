@@ -76,12 +76,14 @@ from google.cloud import firestore
 
 from app.config import (
     GEOCODE_CACHE_FUZZY_THRESHOLD,
+    GEOCODE_CACHE_NAME_MATCH_SPREAD_METERS,
     GEOCODE_CACHE_SNAPSHOT_TTL_SECONDS,
     GEOCODE_CACHE_UNVERIFIED_TTL_DAYS,
 )
 from app.db.clients import get_fs_client
 from app.services.address_match import (
     building_name_conflict, door_numbers, is_precise, loose_key, match_key,
+    name_match_words, name_words_in_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -369,6 +371,75 @@ def _fuzzy_lookup(normalized: str):
     return None  # cache miss -> caller falls through to places_search_address()
 
 
+def _entry_text(data: dict) -> str:
+    """The label text an entry was saved under (raw spelling plus the
+    normalized and absorbed variants), for reading the names it carries."""
+    parts = [data.get("address_raw"), data.get("geocode_address_raw"), data.get("address_normalized")]
+    parts.extend(data.get("address_normalized_variants") or [])
+    return " ".join(str(p) for p in parts if p)
+
+
+def _name_lookup(match_names, requested_pin=None, landmark=None):
+    """Building-name match against VERIFIED entries, after exact and fuzzy miss.
+
+    For labels whose text is too different from a cached label for the fuzzy
+    score ("Godrej Park Retreat, Sarjapura Road, Kodathi Wipro" vs "Tower C,
+    Godrej Park Retreat, Chikkakkannahali, Hadosiddapura, Carmelaram, ..."),
+    but which name the same building. Tower/wing/block/flat labels and numbers
+    and the landmark carry no weight; the building name carries all of it:
+
+      * a name needs 2+ distinctive words and EVERY one must be in the entry
+        (one shared word is never enough);
+      * a name that is only the label's landmark words is not a building name;
+      * a pincode on both sides must agree;
+      * the matching entries must sit within GEOCODE_CACHE_NAME_MATCH_SPREAD_METERS
+        of each other - a name that points at several far-apart places
+        ("Shubh Enclave") is not a unique place, so nothing is used.
+
+    Returns (doc_id, data) of the matching entry nearest the matches' centre, or
+    None. Never raises on a bad entry.
+    """
+    landmark_words = set(name_match_words(landmark or ""))
+    names = []
+    for name in match_names or []:
+        words = name_match_words(name)
+        if len(words) < 2 or set(words) <= landmark_words:
+            continue
+        names.append(words)
+    if not names:
+        return None
+
+    matches = []
+    for doc_id, data in _verified_entries():
+        if data.get("latitude") is None or data.get("longitude") is None:
+            continue
+        if requested_pin:
+            entry_pins = _label_evidence_pincodes(data)
+            if entry_pins and requested_pin not in entry_pins:
+                continue
+        text = _entry_text(data)
+        if any(name_words_in_text(words, text) for words in names):
+            matches.append((doc_id, data))
+    if not matches:
+        return None
+
+    for _id_a, a in matches:
+        for _id_b, b in matches:
+            gap = distance_meters(a["latitude"], a["longitude"], b["latitude"], b["longitude"])
+            if gap is not None and gap > GEOCODE_CACHE_NAME_MATCH_SPREAD_METERS:
+                logger.info("Name cache match skipped: %d verified entries %.0f m apart", len(matches), gap)
+                return None
+
+    lat = sum(d["latitude"] for _i, d in matches) / len(matches)
+    lon = sum(d["longitude"] for _i, d in matches) / len(matches)
+
+    def _centre_gap(item):
+        gap = distance_meters(item[1]["latitude"], item[1]["longitude"], lat, lon)
+        return gap if gap is not None else 0.0
+
+    return min(matches, key=_centre_gap)
+
+
 def _label_evidence_pincodes(data: dict) -> set:
     """Pincodes this entry already has evidence for.
 
@@ -418,6 +489,9 @@ def get_cached_geocode_with_outcome(
     address: str,
     lookup_address: Optional[str] = None,
     include_cache_id: bool = False,
+    match_names=None,
+    landmark: Optional[str] = None,
+    name_match: bool = False,
 ) -> Tuple[Optional[dict], str]:
     """Return a cached result and its outcome: exact_hit, fuzzy_hit, or miss.
 
@@ -429,6 +503,11 @@ def get_cached_geocode_with_outcome(
     `pincode_match` on a hit and is not used as the lookup key.
 
     If `lookup_address` is omitted the behaviour is identical to before.
+
+    `name_match` (feature flag cacheNameMatch, read by the caller) adds one last
+    try after exact and fuzzy miss: `_name_lookup` on `match_names`. It reports
+    as a fuzzy_hit, and its spelling is NOT recorded as a variant of the entry.
+    Off by default, so existing callers behave exactly as before.
     """
     key_str = lookup_address if lookup_address else address
     normalized = normalize_address(key_str)
@@ -437,9 +516,17 @@ def get_cached_geocode_with_outcome(
 
     hit = _exact_lookup(normalized)
     outcome = "exact_hit"
+    by_name = False
     if not hit:
         hit = _fuzzy_lookup(normalized)
         outcome = "fuzzy_hit"
+    if not hit and name_match:
+        pin_match = PINCODE_RE.search(address or "") or PINCODE_RE.search(key_str or "")
+        hit = _name_lookup(match_names, pin_match.group(0) if pin_match else None, landmark)
+        by_name = bool(hit)
+        if hit:
+            logger.info("Name cache hit for '%s' -> entry %s (names %s)",
+                        normalized[:60], hit[0], list(match_names or [])[:3])
     if not hit:
         return None, "miss"
 
@@ -449,7 +536,7 @@ def get_cached_geocode_with_outcome(
             "hit_count": firestore.Increment(1),
             "last_hit_at": firestore.SERVER_TIMESTAMP,
         })
-        if outcome == "fuzzy_hit":
+        if outcome == "fuzzy_hit" and not by_name:
             _record_variant(_collection().document(doc_id), normalized)
     except Exception:
         logger.exception("Geocode cache hit_count update failed")
